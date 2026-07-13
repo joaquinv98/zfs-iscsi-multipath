@@ -1,0 +1,25 @@
+# Ejemplo de entrada en /etc/pve/storage.cfg para el plugin zfsiscsimp.
+# Copiar el bloque (respetando los TABs de indentacion que usa PVE).
+
+zfsiscsimp: mp-storage
+	portal 10.90.1.11
+	extraportals 10.90.2.11
+	target iqn.2026-07.ar.ntc:kbuild01-tank
+	pool tank
+	iscsiprovider LIO
+	lio_tpg tpg1
+	blocksize 16k
+	content images
+	shared 1
+	zfs-base-path /dev/zvol
+	sparse 1
+
+# Notas:
+#  portal / extraportals : los portales del MISMO target y TPG. La sesion iSCSI se
+#                          establece a cada uno; dm-multipath los coalesce por WWID.
+#                          Acepta host o host:port; varios extraportals coma-separados.
+#  shared 1              : OBLIGATORIO para migracion en vivo / HA (el tipo custom no
+#                          esta en la lista @SHARED_STORAGE del core de PVE).
+#  zfs-base-path         : donde aparecen los zvol en el target (Debian: /dev/zvol).
+#  lio_tpg               : el TPG del target (formato tpgN).
+#  blocksize             : volblocksize del zvol (16k recomendado por ZFS).

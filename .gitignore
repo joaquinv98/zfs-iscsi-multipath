@@ -1,0 +1,13 @@
+# referencia local del código de pve-storage (no redistribuir; se baja del upstream)
+pve-src/
+
+# artefactos de test
+*.log
+*.out
+tmp/
+scratch/
+
+# editor
+*.swp
+*~
+.DS_Store

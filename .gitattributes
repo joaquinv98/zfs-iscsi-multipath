@@ -1,0 +1,6 @@
+# estos archivos corren en Linux: siempre LF, nunca CRLF
+*.sh   text eol=lf
+*.pm   text eol=lf
+*.md   text
+LICENSE text
+conf/*.example text eol=lf

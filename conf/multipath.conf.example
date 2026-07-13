@@ -1,0 +1,40 @@
+# /etc/multipath.conf para nodos PVE que usan el plugin zfsiscsimp con targets LIO.
+# Clave: user_friendly_names no (el plugin resuelve por WWID / by-id).
+
+defaults {
+    user_friendly_names   no
+    find_multipaths       no
+    path_grouping_policy  multibus
+    path_selector         "round-robin 0"
+    path_checker          tur
+    failback              immediate
+    no_path_retry         18
+    rr_min_io_rq          1
+    dev_loss_tmo          30
+}
+
+blacklist {
+    devnode "^(ram|zram|raw|loop|fd|md|dm-|sr|scd|st|nvme)[0-9]*"
+    devnode "^sda[0-9]*$"
+    devnode "^vd[a-z]"
+}
+
+blacklist_exceptions {
+    device {
+        vendor  "LIO-ORG"
+        product ".*"
+    }
+}
+
+# Opcional: afinar por-device para LIO
+devices {
+    device {
+        vendor              "LIO-ORG"
+        product             ".*"
+        path_grouping_policy multibus
+        path_checker        tur
+        hardware_handler    "1 alua"
+        failback            immediate
+        no_path_retry       18
+    }
+}
