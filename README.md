@@ -1,86 +1,50 @@
-# zfsiscsimp — ZFS over iSCSI multipath para Proxmox VE
+# zfsiscsimp — ZFS over iSCSI multipath para Proxmox VE 9
 
-Plugin de storage custom que da **multipath real** a "ZFS over iSCSI" en PVE, usando el
-kernel iSCSI initiator (open-iscsi) + dm-multipath en vez del libiscsi single-path del
-plugin `zfs` stock. Hereda todo el manejo del lado storage (zvol por SSH + LunCmd::LIO).
+Plugin custom que conserva el control-plane del backend ZFS-over-iSCSI de PVE
+(ZFS por SSH + `LunCmd::LIO`) y reemplaza el dataplane libiscsi single-path por
+open-iscsi + dm-multipath.
 
-Ver [docs/DESIGN.md](docs/DESIGN.md) (arquitectura y decisiones) y
-[docs/RESULTS.md](docs/RESULTS.md) (pruebas y números). PoC validado el 2026-07-13;
-**no es drop-in de producción** todavía (ver sección 5 de RESULTS).
+Estado: **production candidate para redundancia de red + migración/HA**, validado en un
+cluster PVE 9.2 de 2 nodos (API 15): migración en vivo ida y vuelta, bajo IO del guest, y
+a un nodo con un path degradado, con teardown limpio del origen (ver docs/RESULTS.md).
+No convierte un único servidor ZFS/LIO en storage HA: para tolerar la caída completa del
+target hace falta otra arquitectura (controladoras/targets redundantes o un backend
+distribuido) — eso es arquitectónico, no del plugin.
 
-## Estructura
-
-```
-src/PVE/Storage/Custom/ZFSiSCSIMPPlugin.pm   el plugin
-install.sh                                    instalador (deps + plugin + multipath.conf)
-conf/storage.cfg.example                      entrada de ejemplo para /etc/pve/storage.cfg
-conf/multipath.conf.example                   /etc/multipath.conf recomendado
-tests/01-perf.sh                              fio multipath vs single vs libiscsi
-tests/02-failover-local.sh                    failover con corte por iptables
-tests/03-resize-and-vm.sh                     resize online + VM real cirros
-docs/DESIGN.md  docs/RESULTS.md               diseño y resultados
-```
-
-Instalación rápida: `sudo ./install.sh` en cada nodo PVE, luego seguir los pasos de abajo.
+Documentación: [diseño](docs/DESIGN.md) y [resultados reproducibles](docs/RESULTS.md).
 
 ## Requisitos
 
-**Target (server ZFS + LIO):** los portales del mismo target deben estar en **el mismo
-TPG** (mismo LUN, mismo WWID → multipath los coalesce). Con targetcli:
-```
-/iscsi/<iqn>/tpg1/portals create <IP_portal_1> 3260
-/iscsi/<iqn>/tpg1/portals create <IP_portal_2> 3260
-```
-
-**Nodo PVE (initiator):**
-```
-apt-get install open-iscsi multipath-tools
-systemctl enable --now iscsid multipathd
-```
-`/etc/multipath.conf` (lo importante):
-```
-defaults {
-    user_friendly_names no
-    find_multipaths     no
-    path_grouping_policy multibus
-    path_selector       "round-robin 0"
-    path_checker        tur
-    failback            immediate
-    no_path_retry       18
-}
-blacklist { devnode "^(ram|zram|raw|loop|fd|md|dm-|sr|scd|st|nvme)[0-9]*"; devnode "^sda[0-9]*$"; devnode "^vd[a-z]" }
-blacklist_exceptions { device { vendor "LIO-ORG"; product ".*" } }
-```
+- PVE 9.x en cada initiator, con `open-iscsi` y `multipath-tools`.
+- LIO y ZFS en el target.
+- Al menos dos portales del mismo IQN y el mismo TPG.
+- Una llave SSH por host/portal en `/etc/pve/priv/zfs/<host>_id_rsa`.
+- `shared 1`; el plugin lo rechaza si falta.
+- Recomendado: ACL explícito y CHAP para login y SendTargets.
 
 ## Instalación
 
-```
+En cada nodo PVE:
+
+```bash
 sudo ./install.sh
 ```
-Instala deps (open-iscsi, multipath-tools), copia el plugin a
-`/usr/share/perl5/PVE/Storage/Custom/`, pone `/etc/multipath.conf` si no existe, verifica
-que el plugin carga y recarga el daemon de PVE. Manual, si preferís:
-```
-cp src/PVE/Storage/Custom/ZFSiSCSIMPPlugin.pm /usr/share/perl5/PVE/Storage/Custom/
-perl -e 'use PVE::Storage::Custom::ZFSiSCSIMPPlugin; print "OK\n"'
-systemctl reload-or-restart pvedaemon pveproxy
-```
 
-SSH sin password del nodo al target (para leer `saveconfig.json` y manejar el LUN), un par
-por portal (podés reusar la misma llave si es el mismo host):
-```
-mkdir -p /etc/pve/priv/zfs
-ssh-keygen -t ed25519 -N '' -f /etc/pve/priv/zfs/<IP_portal_1>_id_rsa
-cp /etc/pve/priv/zfs/<IP_portal_1>_id_rsa /etc/pve/priv/zfs/<IP_portal_2>_id_rsa
-# instalar la .pub en root@<target>:~/.ssh/authorized_keys
-```
+El instalador valida Perl/API antes de recargar PVE, conserva una copia timestamped y
+restaura automáticamente el plugin previo si falla el loader o un daemon. Si ya existe
+`/etc/multipath.conf`, no lo reemplaza: compararlo con
+`conf/multipath.conf.example` y validar con `multipath -t` antes del reload.
 
-## Configuración (`/etc/pve/storage.cfg`)
+La política incluida usa `find_multipaths strict` y un blacklist default-deny con
+excepción por vendor `LIO-ORG`; `activate_volume` admite el WWID explícitamente. Esto
+evita que un disco local cambie de nombre y termine capturado por multipath.
 
-```
+## Configuración PVE
+
+```text
 zfsiscsimp: mp-storage
-	portal 192.168.34.11
-	extraportals 192.168.34.13
+	portal 10.90.1.11
+	extraportals 10.90.2.11
 	target iqn.2026-07.ar.ntc:kbuild01-tank
 	pool tank
 	iscsiprovider LIO
@@ -88,34 +52,72 @@ zfsiscsimp: mp-storage
 	blocksize 16k
 	content images
 	shared 1
-	zfs-base-path /dev/zvol
 	sparse 1
+	zfs-base-path /dev/zvol
+	chapuser pve-initiator
 ```
-- `extraportals`: portal(es) adicional(es) del mismo target/TPG, coma-separados
-  (`host` o `host:port`). Es la única propiedad nueva vs el plugin `zfs`.
-- `shared 1`: **obligatorio** para migración en vivo / HA (el tipo custom no está en la
-  lista `@SHARED_STORAGE` del core, así que hay que declararlo a mano).
-- `zfs-base-path /dev/zvol`: en Debian los zvol están en `/dev/zvol/<pool>/...`, no `/dev/`.
 
-## Cómo funciona (resumen)
+La contraseña CHAP se carga como propiedad sensible, no se escribe en `storage.cfg`:
 
-1. `activate_storage`/`activate_volume` → `iscsiadm` login a todos los portales; dm-multipath
-   arma un solo device con N paths.
-2. `path()` → `/dev/disk/by-id/dm-uuid-mpath-<wwid>` (nombre estable). El WWID se deriva del
-   `unit_serial` que LIO autogenera (`36001405` + 25 hex del serial), leído del
-   `saveconfig.json` del target por SSH.
-3. `qemu_blockdev_options` → entrega a QEMU el device multipath como `host_device` (bypassa
-   el driver `iscsi`/libiscsi del plugin stock).
-4. `deactivate_volume`/`free_image` → flush del map + borrado de los sd slaves + saca el WWID
-   de bindings (sin cerrar la sesión compartida).
-5. `volume_resize` → rescan + `multipathd resize map`.
+```bash
+pvesm set mp-storage --chapuser pve-initiator --password 'secreto-largo'
+```
 
-## Limitaciones conocidas
+Queda en `/etc/pve/priv/storage/mp-storage.zfsiscsimp-chap`, modo `0600`. El mismo
+usuario/secreto debe configurarse en el ACL del initiator y en `discovery_auth` de LIO.
+Los node records ya conectados deben reloguearse después de cambiar timers o CHAP.
 
-Ver docs/RESULTS.md §5. Las principales: validado con 2 bridges internos aislados (no 2
-redes físicas todavía), falta test de migración multi-nodo, y el `--rescan` es de sesión
-completa (puede re-agregar maps idle de volúmenes desactivados; mitigado con `multipath -w`).
+OpenZFS 2.2+ usa 16 KiB como default equilibrado. Para guests 4K random puede convenir
+`blocksize 4k`, con mayor metadata/menor eficiencia de espacio; medir en el pool real.
+PVE trata este campo como fijo en la entrada de storage y ZFS no permite cambiar el
+`volblocksize` de un zvol existente: elegirlo antes de cargar datos.
 
-## Licencia
+## Comportamiento importante
 
-AGPL-3.0-or-later (deriva de `PVE::Storage::ZFSPlugin` de pve-storage, AGPL). Ver `LICENSE`.
+- Lee identidad, WWID y LUN exacto desde el `saveconfig.json` de LIO.
+- El control-plane SSH conmuta entre portales; una mutación se ejecuta una sola vez.
+- Discovery y login soportan CHAP; login concurrente es idempotente.
+- Escanea únicamente el LUN solicitado, no toda la sesión.
+- Entrega a QEMU `/dev/disk/by-id/dm-uuid-mpath-<WWID>` como `host_device`.
+- Un teardown incompleto aborta delete/rollback en vez de ocultar el error.
+- Resize verifica el tamaño final del mapa dm.
+- Snapshot rollback y template conversion invalidan WWID/cache correctamente.
+
+## Tests destructivos
+
+Todos usan un VMID/LUN descartable, rechazan colisiones y requieren confirmación:
+
+```bash
+sudo env CONFIRM_DESTRUCTIVE=YES bash tests/00-smoke-lifecycle.sh
+sudo env CONFIRM_DESTRUCTIVE=YES bash tests/01-perf.sh
+sudo env CONFIRM_DESTRUCTIVE=YES bash tests/02-failover-local.sh
+sudo env CONFIRM_DESTRUCTIVE=YES bash tests/03-resize-and-vm.sh
+sudo env CONFIRM_DESTRUCTIVE=YES bash tests/04-control-plane.sh
+sudo env CONFIRM_DESTRUCTIVE=YES bash tests/05-security.sh
+sudo env CONFIRM_DESTRUCTIVE=YES bash tests/06-target-reboot.sh
+```
+
+El benchmark puede limitar cada fabric virtual sin tocar management. Aplica `tc` en
+initiator+target, guarda configuración/contadores y restaura `fq_codel` al salir:
+
+```bash
+sudo env CONFIRM_DESTRUCTIVE=YES RATE_LIMIT_MBIT=100 bash tests/01-perf.sh
+```
+
+`TEST_MODES=multipath` o `TEST_MODES=single` permiten repetir sólo una mitad. La fase
+single bloquea un portal y espera exactamente un path usable, por lo que `pvestatd` no
+puede sesgar el resultado relogueando la sesión durante la medición.
+
+Los traps quitan reglas de firewall y liberan sólo el volumen que el test creó. Los tests
+que cierran una sesión o reinician el target se niegan a correr si una VM activa usa el
+storage.
+
+## Límites que siguen siendo arquitectónicos
+
+- Un solo host ZFS/LIO es un SPOF aunque tenga dos redes.
+- `shared 1` habilita semántica HA/migration, pero falta certificación multi-node.
+- Es un plugin fuera del core; cada upgrade de `libpve-storage-perl` requiere repetir
+  compile/load/smoke contra el nuevo `PVE::Storage::APIVER`.
+- Los números del lab anidado no dimensionan hardware físico.
+
+Licencia: AGPL-3.0-or-later; deriva de `PVE::Storage::ZFSPlugin`.

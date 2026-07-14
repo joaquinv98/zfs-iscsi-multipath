@@ -3,20 +3,20 @@
 
 defaults {
     user_friendly_names   no
-    find_multipaths       no
-    path_grouping_policy  multibus
-    path_selector         "round-robin 0"
-    path_checker          tur
-    failback              immediate
-    no_path_retry         18
-    rr_min_io_rq          1
-    dev_loss_tmo          30
+    # Only WWIDs explicitly admitted by activate_volume are mapped. This is
+    # critical on PVE hosts which also have local sdX disks.
+    find_multipaths       strict
+    polling_interval      1
+    max_polling_interval  1
 }
 
 blacklist {
-    devnode "^(ram|zram|raw|loop|fd|md|dm-|sr|scd|st|nvme)[0-9]*"
-    devnode "^sda[0-9]*$"
-    devnode "^vd[a-z]"
+    # Default-deny at the same matching level as the LIO exception below;
+    # never rely on unstable sdX enumeration to distinguish local disks.
+    device {
+        vendor  ".*"
+        product ".*"
+    }
 }
 
 blacklist_exceptions {
@@ -32,9 +32,15 @@ devices {
         vendor              "LIO-ORG"
         product             ".*"
         path_grouping_policy multibus
+        path_selector       "round-robin 0"
         path_checker        tur
-        hardware_handler    "1 alua"
+        prio                alua
         failback            immediate
-        no_path_retry       18
+        no_path_retry       60
+        fast_io_fail_tmo    2
+        # no_path_retry * polling_interval is 60s; keep dev_loss above it.
+        dev_loss_tmo        70
+        rr_min_io_rq        1
+        retain_attached_hw_handler yes
     }
 }

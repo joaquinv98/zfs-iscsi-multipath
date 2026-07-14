@@ -1,73 +1,232 @@
 #!/bin/bash
-# Test battery for the zfsiscsimp multipath storage, run on pvenest01 (initiator).
-# Storage 'mptest' registered; target on kbuild01 has 2 portals (.11 primary, .13 extra).
-set -u
-STORAGE=mptest
-VOL=vm-888-disk-0
-VOLID="$STORAGE:$VOL"
-SIZE=4G
-STORAGE_HOST=192.168.34.11
-PORTAL2=192.168.34.13
-line(){ echo; echo "======== $* ========"; }
+# Reproducible two-path vs one-path benchmark using the same dm-multipath map.
 
-line "0. alloc + activate volumen de prueba ($SIZE)"
-sudo pvesm alloc "$STORAGE" 888 "$VOL" "$SIZE" 2>&1 | grep -v volblocksize | tail -1
-sudo perl -e 'use PVE::Storage; my $c=PVE::Storage::config(); PVE::Storage::activate_volumes($c,["'"$VOLID"'"]);'
-MP=$(sudo pvesm path "$VOLID")
-DM=$(readlink -f "$MP")
-SD1=$(ls /sys/block/$(basename "$DM")/slaves | head -1)
-SINGLE="/dev/$SD1"
-LUN=$(sudo perl -e 'use PVE::Storage; my $c=PVE::Storage::config(); my $s=PVE::Storage::storage_config($c,"mptest"); my $g=PVE::Storage::Custom::ZFSiSCSIMPPlugin->zfs_get_lu_name($s,"'"$VOL"'"); print PVE::Storage::Custom::ZFSiSCSIMPPlugin->zfs_get_lun_number($s,$g);' 2>/dev/null)
-URL="iscsi://$STORAGE_HOST/iqn.2026-07.ar.ntc:kbuild01-tank/$LUN"
-echo "multipath=$MP  single=$SINGLE  lun=$LUN"
-echo "paths:"; sudo multipath -ll "$MP" | grep -E "running|failed"
+TEST_SIZE=${TEST_SIZE:-6G}
+# lib.sh is resolved relative to this script at runtime.
+# shellcheck disable=SC1091
+source "$(dirname "$0")/lib.sh"
 
-fio_run(){ # $1=dev $2=rw $3=bs $4=label
-  sudo fio --name="$4" --filename="$1" --direct=1 --ioengine=libaio --rw="$2" --bs="$3" \
-    --iodepth=32 --numjobs=4 --runtime=12 --time_based --group_reporting --norandommap \
-    --output-format=terse --terse-version=3 2>/dev/null | awk -F';' '
-    { rbw=$7; riops=$8; wbw=$48; wiops=$49;
-      printf "  %-24s R:%8.1f MB/s %7d iops   W:%8.1f MB/s %7d iops\n", "'"$4"'", rbw/1024, riops, wbw/1024, wiops }'
+RUNTIME=${RUNTIME:-20}
+REPEATS=${REPEATS:-2}
+IODEPTH=${IODEPTH:-8}
+PORTAL_SINGLE=${PORTAL_SINGLE:-$PORTAL_B}
+WORKDIR=${WORKDIR:-$(mktemp -d /tmp/zfsiscsimp-perf.XXXXXX)}
+SINGLE_PATH_BLOCKED=0
+RATE_LIMIT_MBIT=${RATE_LIMIT_MBIT:-0}
+RATE_IFACES=${RATE_IFACES:-ens20 ens21}
+TEST_MODES=${TEST_MODES:-multipath single}
+TARGET_SSH_HOST=${TARGET_SSH_HOST:-$PORTAL_A}
+TARGET_SSH_KEY=${TARGET_SSH_KEY:-/etc/pve/priv/zfs/${TARGET_SSH_HOST}_id_rsa}
+RATE_LIMIT_ACTIVE=0
+
+target_ssh() {
+    ssh -n -i "$TARGET_SSH_KEY" -o BatchMode=yes -o ConnectTimeout=3 \
+        "root@$TARGET_SSH_HOST" "$@"
 }
 
-line "1. PERFORMANCE fio: multipath (2 paths RR) vs single path (kernel)"
-for rw in read write randread randwrite; do
-  bs=$([ "${rw#rand}" != "$rw" ] && echo 4k || echo 1M)
-  fio_run "$MP"     "$rw" "$bs" "mpath-$rw"
-  fio_run "$SINGLE" "$rw" "$bs" "single-$rw"
-done
+restore_rate_limits() {
+    local iface local_qdisc remote_qdisc failed=0
+    for iface in $RATE_IFACES; do
+        tc qdisc replace dev "$iface" root fq_codel || failed=1
+        target_ssh tc qdisc replace dev "$iface" root fq_codel || failed=1
+        local_qdisc=$(tc qdisc show dev "$iface")
+        remote_qdisc=$(target_ssh tc qdisc show dev "$iface")
+        [[ "$local_qdisc" == qdisc\ fq_codel*root* ]] || failed=1
+        [[ "$remote_qdisc" == qdisc\ fq_codel*root* ]] || failed=1
+    done
+    if [ "$failed" -eq 0 ]; then
+        RATE_LIMIT_ACTIVE=0
+        return 0
+    fi
+    return 1
+}
 
-line "2. BASELINE libiscsi (plugin stock) vs multipath host_device, mismo QEMU block layer"
-echo "-- libiscsi user-space (1 portal), qemu-img bench write 4k x20000 qd32 --"
-sudo qemu-img bench -f raw -t none -n -c 20000 -d 32 -s 4096 -w "$URL" 2>&1 | grep -iE "completed" || echo "(fallo)"
-echo "-- multipath host_device (kernel, 2 paths) --"
-sudo qemu-img bench -f raw -t none -n -c 20000 -d 32 -s 4096 -w "$MP" 2>&1 | grep -iE "completed" || echo "(fallo)"
+capture_rate_stats() {
+    local iface
+    {
+        date --iso-8601=ns
+        for iface in $RATE_IFACES; do
+            echo "=== $iface ==="
+            tc -s qdisc show dev "$iface"
+        done
+    } >"$WORKDIR/rate-limit-initiator-final.txt"
+    {
+        date --iso-8601=ns
+        for iface in $RATE_IFACES; do
+            echo "=== $iface ==="
+            target_ssh tc -s qdisc show dev "$iface"
+        done
+    } >"$WORKDIR/rate-limit-target-final.txt"
+}
 
-line "3. FAILOVER bajo carga: randwrite 30s, matamos portal $PORTAL2 a t=10s"
-rm -f /tmp/fo_bw.1.log
-sudo fio --name=failover --filename="$MP" --direct=1 --ioengine=libaio --rw=randwrite --bs=4k \
-  --iodepth=16 --numjobs=1 --runtime=30 --time_based --eta=never \
-  --write_bw_log=/tmp/fo --log_avg_msec=500 >/tmp/fio_fo.out 2>&1 &
-FIO_PID=$!
-sleep 10
-echo "[t=10] paths:"; sudo multipath -ll "$MP" | grep -E "running|failed|faulty"
-echo "[t=10] >>> ip link set ens19 down en el storage (mata portal $PORTAL2) <<<"
-ssh -i /etc/pve/priv/zfs/${STORAGE_HOST}_id_rsa -o BatchMode=yes root@$STORAGE_HOST "ip link set ens19 down" 2>&1 || echo "(fallo bajar NIC)"
-sleep 9
-echo "[t=19] paths (un portal caido):"; sudo multipath -ll "$MP" | grep -E "running|failed|faulty"
-echo "[t=19] fio vivo? $(kill -0 $FIO_PID 2>/dev/null && echo SI || echo NO)"
-echo "[t=19] >>> restaurando portal $PORTAL2 <<<"
-ssh -i /etc/pve/priv/zfs/${STORAGE_HOST}_id_rsa -o BatchMode=yes root@$STORAGE_HOST "ip link set ens19 up; ip addr add 192.168.34.13/24 dev ens19 2>/dev/null; true" 2>&1 || true
-sudo iscsiadm -m node -T iqn.2026-07.ar.ntc:kbuild01-tank -p $PORTAL2:3260 --login 2>&1 | tail -1 || true
-wait $FIO_PID 2>/dev/null
-echo "-- fio failover result --"
-grep -iE "err= |IOPS=|io=" /tmp/fio_fo.out | head -4
-sleep 3
-echo "[post] paths recuperados:"; sudo multipath -ll "$MP" | grep -E "running|failed"
+apply_rate_limits() {
+    local iface local_qdisc remote_qdisc
+    [ "$RATE_LIMIT_MBIT" != 0 ] || return 0
+    [[ "$RATE_LIMIT_MBIT" =~ ^[0-9]+([.][0-9]+)?$ ]] ||
+        die "RATE_LIMIT_MBIT must be a positive number or 0"
+    [ -r "$TARGET_SSH_KEY" ] || die "target SSH key '$TARGET_SSH_KEY' is missing"
+    command -v tc >/dev/null || die "local tc not found"
+    target_ssh command -v tc >/dev/null || die "target tc not found"
 
-line "3b. gap de IO durante failover (MB/s cada 500ms alrededor del corte)"
-if [ -f /tmp/fo_bw.1.log ]; then
-  awk -F',' '{mb=$2/1024; t=$1/1000; if(t>=7 && t<=24) printf "  t=%5.1fs  %7.1f MB/s%s\n", t, mb, (mb<0.5?"  <== GAP":"")}' /tmp/fo_bw.1.log
+    # Refuse to overwrite an administrator-supplied qdisc. The test restores
+    # the known fq_codel baseline on every exit path.
+    for iface in $RATE_IFACES; do
+        [[ "$iface" =~ ^[a-zA-Z0-9_.-]+$ ]] || die "invalid interface '$iface'"
+        local_qdisc=$(tc qdisc show dev "$iface")
+        remote_qdisc=$(target_ssh tc qdisc show dev "$iface")
+        [[ "$local_qdisc" == qdisc\ fq_codel*root* ]] ||
+            die "local $iface does not have the expected fq_codel root qdisc"
+        [[ "$remote_qdisc" == qdisc\ fq_codel*root* ]] ||
+            die "target $iface does not have the expected fq_codel root qdisc"
+    done
+
+    RATE_LIMIT_ACTIVE=1
+    for iface in $RATE_IFACES; do
+        tc qdisc replace dev "$iface" root tbf rate "${RATE_LIMIT_MBIT}mbit" \
+            burst 256k latency 100ms
+        target_ssh tc qdisc replace dev "$iface" root tbf \
+            rate "${RATE_LIMIT_MBIT}mbit" burst 256k latency 100ms
+    done
+
+    {
+        echo "rate=${RATE_LIMIT_MBIT}mbit per path; egress shaped on initiator and target"
+        for iface in $RATE_IFACES; do
+            tc qdisc show dev "$iface"
+        done
+    } >"$WORKDIR/rate-limit-initiator.txt"
+    {
+        echo "rate=${RATE_LIMIT_MBIT}mbit per path; target=$TARGET_SSH_HOST"
+        for iface in $RATE_IFACES; do
+            target_ssh tc qdisc show dev "$iface"
+        done
+    } >"$WORKDIR/rate-limit-target.txt"
+}
+
+cleanup() {
+    local rc=$?
+    set +e
+    if [ "$RATE_LIMIT_ACTIVE" -eq 1 ]; then
+        capture_rate_stats || true
+        restore_rate_limits || true
+    fi
+    if [ "$SINGLE_PATH_BLOCKED" -eq 1 ]; then
+        remove_drop_rules
+    fi
+    cleanup_test_volume "$rc"
+}
+trap cleanup EXIT INT TERM
+
+require_test_confirmation
+[[ " $TEST_MODES " == *" multipath "* || " $TEST_MODES " == *" single "* ]] ||
+    die "TEST_MODES must contain 'multipath', 'single', or both"
+
+while read -r vmid; do
+    [ -n "$vmid" ] || continue
+    if qm config "$vmid" | grep -q "${STORAGE}:"; then
+        die "running VM $vmid uses $STORAGE; performance test blocks one shared iSCSI path"
+    fi
+done < <(qm list | awk '$3 == "running" { print $1 }')
+
+log "allocate $TEST_SIZE scratch LUN and precondition its full address range"
+create_test_volume
+MP=$(test_map)
+WWID=$(test_wwid)
+wait_for_paths "$WWID" 2
+
+fio --name=precondition --filename="$MP" --direct=1 --ioengine=libaio --rw=write \
+    --bs=1M --iodepth=32 --size="$TEST_SIZE" --numjobs=1 --group_reporting \
+    --output="$WORKDIR/precondition.txt"
+
+if [ "$RATE_LIMIT_MBIT" != 0 ]; then
+    log "shape each storage path to ${RATE_LIMIT_MBIT} Mbit/s in both directions"
+    apply_rate_limits
 fi
 
-echo "TESTS_DONE (volumen $VOLID queda para el test de VM/resize)"
+run_case() {
+    local mode=$1 rw=$2 bs=$3 repeat=$4
+    local out="$WORKDIR/${mode}-${rw}-${repeat}.json"
+    echo "mode=$mode workload=$rw bs=$bs repeat=$repeat"
+    fio --name="${mode}-${rw}" --filename="$MP" --direct=1 --invalidate=1 \
+        --ioengine=libaio --rw="$rw" --bs="$bs" --iodepth="$IODEPTH" --numjobs=4 \
+        --size=25% --offset_increment=25% --runtime="$RUNTIME" --time_based \
+        --group_reporting --randrepeat=1 --norandommap --output-format=json --output="$out"
+}
+
+wait_for_exact_paths() {
+    local expected=$1 timeout=${2:-30} start=$SECONDS count
+    while (( SECONDS - start < timeout )); do
+        count=$(usable_paths "$WWID")
+        [ "$count" -eq "$expected" ] && return 0
+        sleep 1
+    done
+    multipath -ll "$WWID" >&2 || true
+    die "map did not settle on exactly $expected usable path(s) within ${timeout}s"
+}
+
+if [[ " $TEST_MODES " == *" multipath "* ]]; then
+    log "two usable paths"
+    for repeat in $(seq 1 "$REPEATS"); do
+        run_case multipath read 1M "$repeat"
+        run_case multipath randread 4k "$repeat"
+        run_case multipath write 1M "$repeat"
+        run_case multipath randwrite 4k "$repeat"
+    done
+fi
+
+if [[ " $TEST_MODES " == *" single "* ]]; then
+    log "one usable path through the same dm map"
+    drop_portal "$PORTAL_SINGLE"
+    SINGLE_PATH_BLOCKED=1
+    wait_for_exact_paths 1 30
+    for repeat in $(seq 1 "$REPEATS"); do
+        run_case single read 1M "$repeat"
+        run_case single randread 4k "$repeat"
+        run_case single write 1M "$repeat"
+        run_case single randwrite 4k "$repeat"
+    done
+
+    remove_drop_rules
+    SINGLE_PATH_BLOCKED=0
+    wait_for_paths "$WWID" 2 45
+fi
+
+log "aggregated results (mean across repeats)"
+WORKDIR="$WORKDIR" python3 - <<'PY'
+import glob, json, os, statistics
+
+rows = {}
+for path in glob.glob(os.path.join(os.environ["WORKDIR"], "*.json")):
+    name = os.path.basename(path).removesuffix(".json")
+    mode, workload, _repeat = name.rsplit("-", 2)
+    with open(path) as fh:
+        data = json.load(fh)
+    jobs = data["jobs"]
+    direction = "read" if "read" in workload else "write"
+    stats = jobs[0][direction]
+    bw = stats.get("bw_bytes", 0) / 1_000_000
+    iops = stats.get("iops", 0)
+    clat = stats.get("clat_ns", {})
+    pct = clat.get("percentile", {})
+    p99 = float(pct.get("99.000000", 0)) / 1_000_000
+    rows.setdefault((mode, workload), []).append((bw, iops, p99))
+
+print(f"{'mode':<10} {'workload':<10} {'MB/s':>12} {'IOPS':>12} {'p99 ms':>12}")
+for key in sorted(rows):
+    values = rows[key]
+    means = [statistics.mean(x[i] for x in values) for i in range(3)]
+    print(f"{key[0]:<10} {key[1]:<10} {means[0]:12.1f} {means[1]:12.0f} {means[2]:12.3f}")
+
+if {key[0] for key in rows} == {"multipath", "single"}:
+    print("\nmultipath/single bandwidth ratio")
+    for workload in sorted({key[1] for key in rows}):
+        multi = statistics.mean(x[0] for x in rows[("multipath", workload)])
+        single = statistics.mean(x[0] for x in rows[("single", workload)])
+        print(f"{workload:<10} {multi / single:8.3f}x")
+PY
+
+if [ "$RATE_LIMIT_ACTIVE" -eq 1 ]; then
+    capture_rate_stats
+    restore_rate_limits || die "failed to restore fq_codel on every shaped interface"
+fi
+
+echo "PERF_OK workdir=$WORKDIR"

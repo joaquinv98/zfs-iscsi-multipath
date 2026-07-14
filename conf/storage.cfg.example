@@ -22,4 +22,5 @@ zfsiscsimp: mp-storage
 #                          esta en la lista @SHARED_STORAGE del core de PVE).
 #  zfs-base-path         : donde aparecen los zvol en el target (Debian: /dev/zvol).
 #  lio_tpg               : el TPG del target (formato tpgN).
-#  blocksize             : volblocksize del zvol (16k recomendado por ZFS).
+#  blocksize             : volblocksize del zvol (16k recomendado por ZFS). Es fijo en
+#                          la entrada PVE e inmutable en cada zvol: elegir antes de usar.
