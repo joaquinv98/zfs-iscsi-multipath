@@ -21,6 +21,12 @@ Documentación: [diseño](docs/DESIGN.md) y [resultados reproducibles](docs/RESU
 - Una llave SSH por host/portal en `/etc/pve/priv/zfs/<host>_id_rsa`.
 - `shared 1`; el plugin lo rechaza si falta.
 - Recomendado: ACL explícito y CHAP para login y SendTargets.
+- En cluster: un ACL/IQN por nodo (mismo CHAP). pmxcfs propaga `storage.cfg`, el secreto
+  CHAP y las llaves SSH al unir un nodo.
+- Para **HA** (`ha-manager`): `install.sh` reinicia también `pve-ha-lrm`/`pve-ha-crm` para
+  que reconozcan el plugin; sin eso la recuperación HA falla con "unsupported type". Un
+  cluster de 2 nodos necesita un **QDevice** (u otro 3er voto) para conservar quórum y poder
+  fencear/recuperar al perder un nodo.
 
 ## Instalación
 

@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.2.2 — 2026-07-14
+
+HA real certificada (recuperación automática ante muerte de nodo) + fix de deployment.
+
+- **HA validada**: cluster de 2 nodos con QDevice (`corosync-qnetd`), VM como recurso
+  `ha-manager`, watchdog `softdog`. Power-off duro del nodo activo → fence (~144 s) →
+  la VM revive sola en el nodo superviviente con su disco multipath y 2 paths; guest
+  cold-boot crash-consistent. Ver docs/RESULTS.md.
+- **Fix production-critical (`install.sh`)**: los daemons HA `pve-ha-lrm` y `pve-ha-crm`
+  no se reiniciaban al instalar el plugin, así que cacheaban el registro de `PVE::Storage`
+  sin el tipo custom. Resultado: la recuperación HA fallaba con
+  `unsupported type 'zfsiscsimp' ... storage does not exist` aunque la migración manual
+  (vía pvedaemon) funcionara. El instalador ahora reinicia también los daemons HA presentes.
+  El plugin en sí no cambió (solo el procedimiento de instalación/recarga de daemons).
+- Nota operativa documentada: un cluster de 2 nodos necesita un QDevice (u otro 3er voto)
+  para que el fencing pueda recuperar tras perder un nodo; sin él no hay quórum.
+
 ## 0.2.1 — 2026-07-14
 
 Validado en cluster PVE real de 2 nodos con migración en vivo; fixes de la review 0.2.0.

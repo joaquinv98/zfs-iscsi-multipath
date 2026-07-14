@@ -116,6 +116,42 @@ hace `activate_storage`, pero el path no vuelve al map hasta la siguiente `activ
 (rescan por-LUN) o hasta que el path checker de multipathd descubra el nuevo device. Se
 autorresuelve, pero no es instantáneo.
 
+### HA real: recuperación automática ante muerte de nodo (2026-07-14)
+
+Se agregó un **QDevice** (`corosync-qnetd` en kbuild01) como tercer voto para que el cluster
+de 2 nodos mantenga quórum al perder uno (Expected votes 3, Quorum 2). VM 8888 se puso como
+recurso HA (`ha-manager add vm:8888 --state started`), watchdog `softdog` armado en ambos nodos.
+
+Prueba de fuego: **power-off duro de pvenest01** (vía API de Proxmox, con la VM corriendo ahí
+y el guest escribiendo). Timeline observado desde pvenest02:
+
+| t (s) | evento |
+|---|---|
+| 0 | pvenest01 muere; pvenest02 + QDevice siguen Quorate (2/3) |
+| ~144 | fence completado; HA relocaliza `vm:8888` a pvenest02 (`starting`) |
+| ~150–300 | `qm start` FALLA en loop → servicio en estado `error` |
+| (fix) | reinicio de `pve-ha-lrm`/`pve-ha-crm` → recuperación exitosa, VM `started` con 2 paths |
+
+**Bug production-critical encontrado (solo aparece en HA real)**: el `qm start` de la
+recuperación falló con `unsupported type 'zfsiscsimp' ... storage 'mptest' does not exist`. El
+daemon `pve-ha-lrm` (el que arranca la VM en el failover HA) había cacheado el registro de
+plugins de `PVE::Storage` al iniciar y **no conocía el plugin custom** — el `install.sh`
+reiniciaba pvedaemon/pveproxy/pvestatd/pvescheduler pero NO los daemons HA. Por eso la
+migración manual (disparada por pvedaemon, que sí se reinicia) funcionaba y el recovery HA no.
+Corregido: `install.sh` ahora reinicia también `pve-ha-lrm` y `pve-ha-crm`. Tras el fix, la VM
+revive sola en el nodo superviviente con su disco multipath y 2 paths, y el guest cirros
+bootea en frío (power-cycle crash-consistent, no resume — lo esperado en HA).
+
+Resumen HA:
+
+| Prueba | Resultado |
+|---|---|
+| QDevice 3er voto, quórum sobrevive a muerte de nodo | PASS |
+| fencing del nodo muerto (watchdog softdog) | PASS (~144 s) |
+| relocalización + `qm start` del recurso HA | PASS (tras reiniciar daemons HA) |
+| VM recuperada con disco multipath y 2 paths | PASS |
+| guest cold-boot en el nodo superviviente | PASS |
+
 ## Kernel patch
 
 - Runtime GET LBA STATUS: 8 passed, 0 failed.

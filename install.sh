@@ -83,13 +83,27 @@ else
     echo "==> /etc/multipath.conf ya existe - reviselo contra conf/multipath.conf.example"
 fi
 
+# Every long-running daemon that loads PVE::Storage caches the plugin registry
+# at startup, so it must be restarted to learn about a Custom/ plugin. This
+# INCLUDES the HA stack (pve-ha-lrm / pve-ha-crm): without restarting them, a
+# node that recovers an HA guest onto this storage fails with
+# "unsupported type 'zfsiscsimp' ... storage does not exist" even though manual
+# start/migration (driven by pvedaemon) works. systemctl handles the LRM
+# watchdog handoff; only pve-ha-lrm/crm units present on the node are touched.
+STORAGE_DAEMONS="pvedaemon pveproxy pvestatd pvescheduler"
+for ha in pve-ha-lrm pve-ha-crm; do
+    systemctl list-unit-files "${ha}.service" >/dev/null 2>&1 &&
+        STORAGE_DAEMONS="$STORAGE_DAEMONS $ha"
+done
+
 echo "==> recargar todos los daemons persistentes que cargan PVE::Storage"
-for service in pvedaemon pveproxy pvestatd pvescheduler; do
+echo "    ($STORAGE_DAEMONS)"
+for service in $STORAGE_DAEMONS; do
     systemctl reload-or-restart "$service"
     systemctl is-active --quiet "$service" || {
         echo "    ERROR: $service no quedo activo; restaurando el plugin"
         rollback_plugin
-        for rollback_service in pvedaemon pveproxy pvestatd pvescheduler; do
+        for rollback_service in $STORAGE_DAEMONS; do
             systemctl reload-or-restart "$rollback_service" || true
         done
         exit 1
