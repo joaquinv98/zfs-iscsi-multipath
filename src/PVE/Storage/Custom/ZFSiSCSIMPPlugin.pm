@@ -24,7 +24,7 @@ use PVE::Storage::ZFSPlugin;
 
 use base qw(PVE::Storage::ZFSPlugin);
 
-our $VERSION = '0.4.0';
+our $VERSION = '0.4.1';
 
 # ZFS over iSCSI with the kernel initiator and dm-multipath.
 #

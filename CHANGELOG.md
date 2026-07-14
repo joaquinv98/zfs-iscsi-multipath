@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.4.1 — 2026-07-14
+
+Artefacto inmutable posterior a la certificación del hardening 0.4.0.
+
+- NOP-Out final `5s/5s`: el intento `2s/2s` del lab podía declarar caído el camino sano
+  bajo saturación; la configuración final mantuvo siempre un path utilizable.
+- Las sesiones abiertas reciben los timeouts seguros online, sin logout ni interrupción
+  durante un rollout rolling.
+- Reliability certificada con CRC: path A 13,25 s, path B 11,35 s y A+B 11,09 s,
+  todos con `fio_err=0`; performance limitada por fabric dio 2,00× en read y write.
+
 ## 0.4.0 — 2026-07-14
 
 Hardening del dataplane y reducción del costo del control-plane.

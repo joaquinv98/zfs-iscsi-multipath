@@ -201,6 +201,30 @@ Estado final: paquete 0.3.3 `ii` en ambos nodos, plugin SHA256 `8b017486…f61ec
 `libpve-storage-perl` 9.1.6, VM HA 8888 corriendo en `pvenest02`, quórum
 y fencing armados, cero updates pendientes.
 
+## Hardening del dataplane 0.4.1 (2026-07-14)
+
+Canario ejecutado en `pvenest01`, dejando la VM HA 8888 activa en `pvenest02`. Cada prueba
+usó un zvol scratch distinto y terminó sin maps, paths, reglas iptables ni qdiscs residuales.
+
+| Prueba | Resultado |
+|---|---|
+| Perl real PVE, stubs CI, `bash -n`, ShellCheck y contrato upstream API 15/age 6 | PASS |
+| build Debian + contenido/metadatos del paquete | PASS |
+| alloc, CRC, snapshot, mutación, rollback con WWID nuevo, resize 3→4 GiB | PASS |
+| control-plane primario black-holed | read 8 s; mutación 6 s; PASS |
+| ambos portales caídos durante `free` | operación rechazada; checksum 64 MiB intacto |
+| path A DROP 15 s | `fio_err=0`; max clat 13,25 s; path B siempre usable |
+| path B DROP 15 s | `fio_err=0`; max clat 11,35 s; path A siempre usable |
+| A+B DROP 8 s | `fio_err=0`; max clat 11,09 s; recuperación + CRC PASS |
+| gate 1×100 vs 2×100 Mbit/s | write 11,41→22,82 MiB/s; read 11,41→22,81 MiB/s; 2,00× |
+
+El primer candidato configuraba NOP-Out en `2s/2s`. Bajo carga sin rate limit el kernel
+también declaró muerta la conexión no bloqueada: un falso failover doble. Se descartó ese
+artefacto, se fijó `5s/5s` y el test ahora falla si cualquier muestra de un corte simple no
+conserva al menos un path `active/running/ready`. Los valores se aplican a las sesiones
+existentes con `iscsiadm -m session --op update`, por lo que un upgrade rolling no requiere
+logout de un volumen en uso.
+
 ## Kernel patch
 
 - Runtime GET LBA STATUS: 8 passed, 0 failed.

@@ -35,7 +35,7 @@ Preferido, en cada nodo PVE drenado/en mantenimiento:
 
 ```bash
 bash packaging/build-deb.sh
-sudo apt install ../pve-storage-zfsiscsimp_0.4.0_all.deb
+sudo apt install ../pve-storage-zfsiscsimp_0.4.1_all.deb
 sudo zfsiscsimp-preflight --local-only
 ```
 
