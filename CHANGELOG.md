@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.4.0 — 2026-07-14
+
+Hardening del dataplane y reducción del costo del control-plane.
+
+- Todos los `iscsiadm`, `multipath` y `multipathd` locales tienen timeout; el login
+  configura además `login_timeout`, `replacement_timeout` y NOP-Out `5s/5s` acotados.
+  Los valores se aplican también a sesiones existentes, sin logout durante un upgrade
+  rolling. El lab descartó `2s/2s` porque podía declarar muerto un path sano bajo saturación.
+- El fallback de identidad ante caída del control-plane vence a los 120 s y nunca usa el
+  LUN stale para remediar paths con un WWID distinto.
+- Si el map no aparece, se invalida la cache y se resuelve la identidad una vez más para
+  cubrir rollback/reasignación atendidos por workers distintos.
+- `activate_storage` exige al menos una sesión iSCSI real y reporta paths degradados sin
+  confundirlos con una caída total.
+- Lecturas idempotentes evitan el probe SSH redundante y fallan sobre los demás portales;
+  las mutaciones conservan ejecución única sobre un host previamente seleccionado.
+- Helpers comunes reemplazan repeticiones de `run_command` y loops de espera, y se quitaron
+  opciones heredadas que no aplican al provider LIO-only.
+- El test de failover exige ahora que el camino sano permanezca utilizable en cada muestra,
+  además de verificar CRC, `fio_err=0` y una latencia máxima coherente con la detección 5s/5s.
+
 ## 0.3.3 — 2026-07-14
 
 Artefacto final del hardening de upgrades.

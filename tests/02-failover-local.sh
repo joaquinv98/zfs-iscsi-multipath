@@ -11,7 +11,7 @@ CUT_AFTER=${CUT_AFTER:-12}
 CUT_DURATION=${CUT_DURATION:-25}
 TEST_ALL_PATHS=${TEST_ALL_PATHS:-1}
 WORKDIR=${WORKDIR:-$(mktemp -d /tmp/zfsiscsimp-reliability.XXXXXX)}
-MAX_SINGLE_PATH_LAT_MS=${MAX_SINGLE_PATH_LAT_MS:-8000}
+MAX_SINGLE_PATH_LAT_MS=${MAX_SINGLE_PATH_LAT_MS:-15000}
 MAX_ALL_PATH_LAT_MS=${MAX_ALL_PATH_LAT_MS:-16000}
 CASES=${CASES:-path-a path-b both-paths}
 FIO_PID=
@@ -81,6 +81,13 @@ run_cut() {
     FIO_PID=
     wait "$MONITOR_PID" || true
     MONITOR_PID=
+    if [ "$label" != both-paths ]; then
+        awk '
+            /active\/running\/ready/ { next }
+            { print "no usable path in sample: " $0 > "/dev/stderr"; bad=1 }
+            END { exit bad }
+        ' "$case_dir/paths.log" || die "$label lost the nominally healthy path"
+    fi
     MAX_LAT_MS=$MAX_SINGLE_PATH_LAT_MS
     [ "$label" = both-paths ] && MAX_LAT_MS=$MAX_ALL_PATH_LAT_MS
     CASE_DIR="$case_dir" MAX_LAT_MS="$MAX_LAT_MS" python3 - <<'PY'

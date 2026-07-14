@@ -1,3 +1,18 @@
+pve-storage-zfsiscsimp (0.4.0) stable; urgency=medium
+
+  * Bound all local iSCSI and multipath dataplane commands with timeouts.
+  * Cap stale identity fallback at 120s and prohibit stale-WWID path remediation.
+  * Re-resolve identity after a map-appearance failure (rollback/realloc race).
+  * Consolidate the run_command and retry-loop idioms into two helpers; drop the
+    SSH probe from saveconfig reads (their own ssh already bounds failover) while
+    keeping the control-plane probe that bounds zfs_request failover.
+  * Fix file_set_contents force_utf8 misuse that corrupted non-ASCII CHAP secrets.
+  * Require at least one live iSCSI session while tolerating degraded paths.
+  * Add a bounded login_timeout and keep the 5s NOP-Out/replacement settings.
+  * Drop LIO-irrelevant options (comstar_*, nowritecache) and other dead code.
+
+ -- Joaquin Varela <joaquinv898@gmail.com>  Tue, 14 Jul 2026 16:30:00 -0300
+
 pve-storage-zfsiscsimp (0.3.3) stable; urgency=medium
 
   * Accept dpkg Status-Abbrev padding while still requiring the ii state.

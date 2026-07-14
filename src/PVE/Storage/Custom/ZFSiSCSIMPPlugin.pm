@@ -17,13 +17,14 @@ use warnings;
 use JSON qw(decode_json encode_json);
 use Time::HiRes qw(usleep);
 
+use PVE::RESTEnvironment qw(log_warn);
 use PVE::Tools qw(file_read_firstline file_set_contents run_command);
 use PVE::Storage::Plugin;
 use PVE::Storage::ZFSPlugin;
 
 use base qw(PVE::Storage::ZFSPlugin);
 
-our $VERSION = '0.3.3';
+our $VERSION = '0.4.0';
 
 # ZFS over iSCSI with the kernel initiator and dm-multipath.
 #
@@ -57,6 +58,26 @@ my $MULTIPATH = '/sbin/multipath';
 my $MULTIPATHD = '/sbin/multipathd';
 my $BLOCKDEV = '/usr/sbin/blockdev';
 
+# Every local dataplane command is bounded: activate_storage runs on each
+# pvestatd cycle, so an unbounded iscsiadm/multipath call against a
+# black-holed portal or a wedged multipathd would grey the node out.
+my $DATAPLANE_TIMEOUT = 30;
+
+# Retry budgets for the sysfs/multipath state machine. Named so the timing
+# is auditable at a glance; the nudge schedules stay as literals at the call
+# sites because they are tuned to the operations they poke.
+my $MAP_APPEAR_TRIES = 40;      # x 500ms = up to 20s for the dm map to appear
+my $PATH_REDUNDANCY_TRIES = 20; # x 500ms = up to 10s for all paths to come up
+my $FLUSH_TRIES = 30;           # backoff, up to ~15s for a busy map to release
+my $RESIZE_TRIES = 10;          # x 300ms for multipathd to resize the map
+my $LOGIN_RACE_TRIES = 10;      # x 100ms for a concurrent login to settle
+my $DELETE_WAIT_TRIES = 20;     # x 100ms for deleted sysfs devices to vanish
+
+# A stale identity may keep an already-attached volume alive during a brief
+# control-plane outage, but an unbounded-age one could drive the reused-LUN
+# path remediation against the wrong volume. Cap how old a fallback may be.
+my $STALE_IDENTITY_MAX_AGE = 120;
+
 sub type { return 'zfsiscsimp'; }
 
 sub plugin_version { return $VERSION; }
@@ -84,7 +105,8 @@ sub properties {
             pattern => '[^\\s:]{1,223}',
         },
         'chap-secret-generation' => {
-            description => "Internal generation that atomically binds storage.cfg to a CHAP secret.",
+            description => "Internal generation that atomically binds storage.cfg to a CHAP secret."
+                . " Managed by the plugin; never set it manually.",
             type => 'string',
             pattern => '[0-9a-f]{32}',
         },
@@ -102,10 +124,7 @@ sub options {
         pool => { fixed => 1 },
         blocksize => { fixed => 1 },
         iscsiprovider => { fixed => 1 },
-        nowritecache => { optional => 1 },
         sparse => { optional => 1 },
-        comstar_hg => { optional => 1 },
-        comstar_tg => { optional => 1 },
         lio_tpg => { fixed => 1 },
         chapuser => { optional => 1 },
         'chap-secret-generation' => { optional => 1 },
@@ -115,6 +134,34 @@ sub options {
         'zfs-base-path' => { optional => 1 },
     };
 }
+
+# --- small command helpers ----------------------------------------------------
+
+# Run a command and return true iff it exited 0. Bounds every call with a
+# timeout by default. Extra run_command options (e.g. outfunc, a different
+# timeout) pass through %opts.
+my $run_ok = sub {
+    my ($cmd, %opts) = @_;
+    $opts{timeout} //= $DATAPLANE_TIMEOUT;
+    my $rc = eval { run_command($cmd, noerr => 1, quiet => 1, %opts) };
+    return defined($rc) && $rc == 0;
+};
+
+# Poll $cond (truthy on success) up to $tries times, sleeping $sleep_us
+# between attempts and calling optional $nudge->($try) before each sleep.
+# Returns the first truthy value from $cond, or undef on timeout.
+my $wait_for = sub {
+    my ($tries, $sleep_us, $cond, $nudge) = @_;
+    for my $try (1 .. $tries) {
+        my $v = $cond->();
+        return $v if $v;
+        $nudge->($try) if $nudge;
+        usleep($sleep_us);
+    }
+    return undef;
+};
+
+# --- portal parsing -----------------------------------------------------------
 
 # host and (optional) port of a portal entry; the iSCSI default port is 3260
 my $split_portal = sub {
@@ -173,6 +220,13 @@ my $validate_config = sub {
     die "zfsiscsimp requires at least two distinct portals\n" if @portals < 2;
     return 1;
 };
+
+# --- CHAP secret store --------------------------------------------------------
+#
+# Secrets are stored as a generation->password map bound to storage.cfg's
+# 'chap-secret-generation'. Rotation stages a new generation alongside the
+# committed one, so a failed pmxcfs write can never switch the credential
+# underneath the still-committed config.
 
 my $chap_password_file = sub {
     my ($storeid) = @_;
@@ -269,8 +323,10 @@ my $stage_chap_password = sub {
     return $generation;
 };
 
+# --- ssh control plane --------------------------------------------------------
+
 my $ssh_key_for_host = sub {
-    my ($scfg, $host) = @_;
+    my ($host) = @_;
     my $key = "$id_rsa_path/${host}_id_rsa";
     return -e $key ? $key : undef;
 };
@@ -300,48 +356,48 @@ my $select_control_scfg = sub {
     my ($cachekey, @hosts) = $ordered_control_hosts->($scfg);
     my @errors;
     for my $host (@hosts) {
-        my $key = $ssh_key_for_host->($scfg, $host);
+        my $key = $ssh_key_for_host->($host);
         if (!defined($key)) {
             push @errors, "$host: SSH key missing";
             next;
         }
-        my $rc = eval {
-            run_command(
-                [@ssh_cmd, '-i', $key, "root\@$host", '--', 'true'],
-                noerr => 1,
-                quiet => 1,
-                timeout => 5,
-            );
-        };
-        if (defined($rc) && $rc == 0) {
+        if ($run_ok->([@ssh_cmd, '-i', $key, "root\@$host", '--', 'true'], timeout => 5)) {
             $control_cache->{$cachekey} = [time(), $host];
             return $scfg_for_control_host->($scfg, $host);
         }
-        push @errors, "$host: " . ($@ || "SSH probe failed (rc=" . (defined($rc) ? $rc : 'undef') . ")");
+        push @errors, "$host: SSH probe failed";
     }
     die "no reachable SSH control portal for '$scfg->{target}': " . join('; ', @errors) . "\n";
 };
 
 # The stock ZFS-over-iSCSI implementation uses only scfg->{portal} for its SSH
-# control plane. Read-only operations may safely fail over and be retried. For
-# mutating operations, probe all portals first and execute exactly once on the
-# selected host to avoid replaying a partially completed target operation.
+# control plane. Every method here first goes through $select_control_scfg,
+# whose 5s SSH probe bounds failover: SUPER::zfs_request inherits the parent's
+# long worker timeout (~1h) and its ssh has no short ConnectTimeout, so without
+# the probe a black-holed portal would stall the operation for minutes before
+# trying the next host. Mutating methods (create_lu/delete_lu/import_lu and the
+# parent's rename/destroy/rollback) then run exactly once on the probed host to
+# avoid replaying a partial operation; read-only methods additionally fail over
+# and retry across the remaining hosts if the probed host dies mid-command.
+#
+# add_view and modify_lu are no-ops in LunCmd::LIO (validate_config enforces the
+# LIO provider), so they join the read-only, retryable set.
 sub zfs_request {
     my ($class, $scfg, $timeout, $method, @params) = @_;
 
-    my %read_only = map { $_ => 1 } qw(get list list_lu list_view zpool_list);
+    my $selected = $select_control_scfg->($scfg);
+
+    my %read_only = map { $_ => 1 }
+        qw(get list list_lu list_view zpool_list add_view modify_lu);
     if (!$read_only{$method}) {
-        my $selected = $select_control_scfg->($scfg);
         return $class->SUPER::zfs_request($selected, $timeout, $method, @params);
     }
 
-    my $selected = $select_control_scfg->($scfg);
-    my $selected_host = $selected->{portal};
     my ($cachekey, @hosts) = $ordered_control_hosts->($scfg);
-    @hosts = ($selected_host, grep { $_ ne $selected_host } @hosts);
+    @hosts = ($selected->{portal}, grep { $_ ne $selected->{portal} } @hosts);
     my @errors;
     for my $host (@hosts) {
-        next if !defined($ssh_key_for_host->($scfg, $host));
+        next if !defined($ssh_key_for_host->($host));
         my $copy = $scfg_for_control_host->($scfg, $host);
         my $result = eval { $class->SUPER::zfs_request($copy, $timeout, $method, @params) };
         if (!$@) {
@@ -352,6 +408,8 @@ sub zfs_request {
     }
     die "control operation '$method' failed through every portal: " . join('; ', @errors) . "\n";
 }
+
+# --- config hooks -------------------------------------------------------------
 
 sub on_add_hook {
     my ($class, $storeid, $scfg, %sensitive) = @_;
@@ -378,7 +436,10 @@ sub on_update_hook_full {
     my ($class, $storeid, $scfg, $update, $delete, $sensitive) = @_;
     if (!defined($delete)) {
         $delete = [];
-        $_[4] = $delete; # let the API apply internal post-hook deletions
+        # NOTE: relies on @_ aliasing so the API applies our post-hook
+        # deletions. Verified against PVE::API2::Storage::Config on PVE 9.x;
+        # zfsiscsimp-preflight asserts this coupling still holds before upgrades.
+        $_[4] = $delete;
     }
 
     die "chap-secret-generation is managed internally; update password instead\n"
@@ -395,9 +456,8 @@ sub on_update_hook_full {
     # mutating the secret file: deleting the password while chapuser stays
     # must be rejected without first unlinking the secret (which is
     # cluster-wide via pmxcfs and would brick activation on every node).
-    my $password_after;
     if (defined($merged->{chapuser})) {
-        $password_after = exists($sensitive->{password})
+        my $password_after = exists($sensitive->{password})
             ? $sensitive->{password}
             : (defined($scfg->{chapuser}) ? $get_chap_password->($storeid, $scfg) : undef);
         die "chapuser requires a stored password\n" if !defined($password_after);
@@ -426,16 +486,13 @@ sub on_update_hook_full {
     return;
 }
 
-sub on_delete_hook {
-    my ($class, $storeid, $scfg) = @_;
-    # This hook runs before storage.cfg commits. Removing the secret here would
-    # leave a still-configured storage unusable if the pmxcfs write then failed.
-    # Keep the mode-0600 orphan; zfsiscsimp-preflight --cleanup-secrets removes
-    # it only after it can prove the storage ID no longer exists.
-    return;
-}
+# on_delete_hook is intentionally NOT overridden: it runs before storage.cfg
+# commits, so removing the CHAP secret here would leave a still-configured
+# storage unusable if the pmxcfs write then failed. The mode-0600 orphan is
+# removed only by 'zfsiscsimp-preflight --cleanup-secrets', which first proves
+# the storage ID no longer exists. The base class no-op is exactly what we want.
 
-# --- WWID of the LIO backstore backing a volume -----------------------------
+# --- LIO identity (WWID + LUN) from the target's saveconfig.json --------------
 #
 # LunCmd::LIO names backstores '<pool with / replaced by -> + - + <volname>'
 # and lets LIO generate the unit serial. dm-multipath names a LIO LUN by the
@@ -450,43 +507,37 @@ my $IDENTITY_CACHE_TTL = 15;
 my $read_saveconfig = sub {
     my ($scfg) = @_;
 
-    # Probe once, then read through the known-reachable host first. Without
-    # this ordering a black-holed host costs one SSH timeout per candidate
-    # saveconfig path before failover.
-    my @portals = $all_portals->($scfg);
-    my $selected = eval { $select_control_scfg->($scfg) };
-    if (defined($selected)) {
-        my $selected_host = $selected->{portal};
-        @portals = (
-            grep { ($split_portal->($_))[0] eq $selected_host } @portals,
-            grep { ($split_portal->($_))[0] ne $selected_host } @portals,
-        );
-    }
+    # Order candidates so the known-reachable host is tried first, reusing the
+    # control cache (populated by any prior control op) instead of paying a
+    # fresh SSH probe here.
+    my ($cachekey, @ordered_hosts) = $ordered_control_hosts->($scfg);
+    my %rank;
+    @rank{@ordered_hosts} = (0 .. $#ordered_hosts);
+    my @portals = sort {
+        ($rank{($split_portal->($a))[0]} // 99) <=> ($rank{($split_portal->($b))[0]} // 99)
+    } $all_portals->($scfg);
 
     for my $portal (@portals) {
         my ($host) = $split_portal->($portal);
-        my $key = $ssh_key_for_host->($scfg, $host);
+        my $key = $ssh_key_for_host->($host);
         next if !defined($key);
 
         for my $cfgpath ('/etc/rtslib-fb-target/saveconfig.json', '/etc/target/saveconfig.json') {
             my $out = '';
-            my $cmd = [@ssh_cmd, '-i', $key, "root\@$host", 'cat', $cfgpath];
-            my $rc = eval {
-                run_command(
-                    $cmd,
-                    # ConnectTimeout only bounds the handshake; a wedged target
-                    # that accepts the connection but hangs in cat would block a
-                    # worker forever without this overall timeout.
-                    timeout => 10,
-                    outfunc => sub { $out .= "$_[0]\n"; },
-                    errfunc => sub { },
-                    noerr => 1,
-                    quiet => 1,
-                );
-            };
-            next if !defined($rc) || $rc != 0 || $out !~ /\S/;
+            # ConnectTimeout only bounds the handshake; a wedged target that
+            # accepts the connection but hangs in cat would block a worker
+            # forever without this overall timeout.
+            next if !$run_ok->(
+                [@ssh_cmd, '-i', $key, "root\@$host", 'cat', $cfgpath],
+                timeout => 10,
+                outfunc => sub { $out .= "$_[0]\n"; },
+            );
+            next if $out !~ /\S/;
             my $config = eval { decode_json($out) };
-            return $config if defined($config);
+            if (defined($config)) {
+                $control_cache->{$cachekey} = [time(), $host];
+                return $config;
+            }
         }
     }
     return undef;
@@ -528,10 +579,6 @@ my $zfsmp_resolve_identity = sub {
         if ($so->{name} eq $bsname) {
             ($serial, $actual_bsname) = ($so->{wwn}, $bsname);
             last;
-        }
-        # legacy backstores created without the pool prefix
-        if ($so->{name} eq $volname && !defined($serial)) {
-            ($serial, $actual_bsname) = ($so->{wwn}, $volname);
         }
     }
     return {
@@ -597,17 +644,19 @@ my $zfsmp_get_identity = sub {
 
     # A stale identity is useful for keeping an already-attached volume
     # operational during a transient control-plane outage. Never use it when
-    # the target definitively reports the backstore absent or structurally bad.
-    if ($resolved->{status} eq 'unavailable' && $resolved->{cached_identity}) {
-        warn "zfsiscsimp: using stale cached identity for '$volname': $resolved->{error}\n";
-        return $resolved->{cached_identity};
+    # the target definitively reports the backstore absent or structurally bad,
+    # and never when it is older than $STALE_IDENTITY_MAX_AGE: a very old LUN
+    # number could have been reassigned to a different volume.
+    my $cached = $resolved->{cached_identity};
+    if ($resolved->{status} eq 'unavailable' && $cached
+        && time() - $cached->{time} < $STALE_IDENTITY_MAX_AGE) {
+        log_warn("zfsiscsimp: using stale cached identity for '$volname': $resolved->{error}");
+        # Never annotate the cache entry itself: the same worker may regain the
+        # control plane before the cache expires.  Callers need this marker to
+        # avoid using a stale LUN number for destructive path remediation.
+        return { %$cached, stale => 1 };
     }
     die "$resolved->{error}\n";
-};
-
-my $zfsmp_get_wwid = sub {
-    my ($scfg, $volname) = @_;
-    return $zfsmp_get_identity->($scfg, $volname)->{wwid};
 };
 
 my $zfsmp_forget_wwid = sub {
@@ -615,6 +664,8 @@ my $zfsmp_forget_wwid = sub {
     my $bsname = $backstore_name->($scfg, $volname);
     delete $identity_cache->{"$scfg->{target}/$bsname"};
 };
+
+# --- multipath device resolution ----------------------------------------------
 
 # Resolve the multipath map device from its WWID independently of
 # user_friendly_names / alias: the dm uuid of a multipath map is always
@@ -633,49 +684,59 @@ my $zfsmp_mapdev = sub {
 my $zfsmp_path_count = sub {
     my ($wwid) = @_;
     my $count = 0;
-    my $rc = eval {
-        run_command(
-            [$MULTIPATHD, 'show', 'paths', 'raw', 'format', '%w|%d|%t|%o|%T'],
-            noerr => 1,
-            quiet => 1,
-            outfunc => sub {
-                my ($line) = @_;
-                my ($path_wwid, undef, $dm_state, $dev_state, $checker_state) = split(/\|/, $line);
-                $count++
-                    if defined($path_wwid)
-                    && $path_wwid eq $wwid
-                    && ($dm_state // '') eq 'active'
-                    && ($dev_state // '') eq 'running'
-                    && ($checker_state // '') eq 'ready';
-            },
-        );
-    };
-    return 0 if !defined($rc) || $rc != 0;
+    return 0 if !$run_ok->(
+        [$MULTIPATHD, 'show', 'paths', 'raw', 'format', '%w|%d|%t|%o|%T'],
+        outfunc => sub {
+            my ($line) = @_;
+            my ($path_wwid, undef, $dm_state, $dev_state, $checker_state) = split(/\|/, $line);
+            $count++
+                if defined($path_wwid)
+                && $path_wwid eq $wwid
+                && ($dm_state // '') eq 'active'
+                && ($dev_state // '') eq 'running'
+                && ($checker_state // '') eq 'ready';
+        },
+    );
     return $count;
 };
 
-# --- iSCSI session management -----------------------------------------------
+# --- iSCSI session management -------------------------------------------------
 
 my $iscsi_sessions = sub {
     my $sessions = {};
-    eval {
-        run_command(
-            [$ISCSIADM, '-m', 'session'],
-            noerr => 1,
-            quiet => 1,
-            outfunc => sub {
-                my ($line) = @_;
-                # tcp: [3] 10.90.1.11:3260,1 iqn.example:target (non-flash)
-                # tcp: [4] [2001:db8::1]:3260,1 iqn.example:target (non-flash)
-                if ($line =~ m/^\S+\s+\[(\d+)\]\s+(\[[^\]]+\]|[^,\s]+):(\d+),\S+\s+(\S+)/) {
-                    my ($sid, $host, $port, $target) = ($1, $2, $3, $4);
-                    $host =~ s/^\[|\]$//g;
-                    $sessions->{lc("$host|$port|$target")} = int($sid);
-                }
-            },
-        );
-    };
+    $run_ok->(
+        [$ISCSIADM, '-m', 'session'],
+        outfunc => sub {
+            my ($line) = @_;
+            # tcp: [3] 10.90.1.11:3260,1 iqn.example:target (non-flash)
+            # tcp: [4] [2001:db8::1]:3260,1 iqn.example:target (non-flash)
+            if ($line =~ m/^\S+\s+\[(\d+)\]\s+(\[[^\]]+\]|[^,\s]+):(\d+),\S+\s+(\S+)/) {
+                my ($sid, $host, $port, $target) = ($1, $2, $3, $4);
+                $host =~ s/^\[|\]$//g;
+                $sessions->{lc("$host|$port|$target")} = int($sid);
+            }
+        },
+    );
     return $sessions;
+};
+
+# Set the CHAP (or None) auth triple onto an iscsiadm object (discoverydb or
+# node), plus any extra name/value settings, via one shared update loop.
+my $iscsi_update_values = sub {
+    my ($selector, @settings) = @_;
+    for my $nv (@settings) {
+        die "iscsiadm update '$nv->[0]' failed\n"
+            if !$run_ok->([@$selector, '--op', 'update', '-n', $nv->[0], '-v', $nv->[1]]);
+    }
+};
+
+my $iscsi_apply_settings = sub {
+    my ($selector, $auth_prefix, $chapuser, $chap_password, @extra) = @_;
+    my @auth = defined($chapuser)
+        ? (['authmethod', 'CHAP'], ['username', $chapuser], ['password', $chap_password])
+        : (['authmethod', 'None'], ['username', ''], ['password', '']);
+    my @settings = (@extra, map { ["$auth_prefix.$_->[0]", $_->[1]] } @auth);
+    $iscsi_update_values->($selector, @settings);
 };
 
 my $zfsmp_login_all = sub {
@@ -684,11 +745,11 @@ my $zfsmp_login_all = sub {
     my $target = $scfg->{target};
     my $sessions = $iscsi_sessions->();
     my @errors;
-    my $chap_password = defined($scfg->{chapuser})
-        ? $get_chap_password->($storeid, $scfg)
-        : undef;
-    die "CHAP is configured for '$storeid' but its password file is missing\n"
-        if defined($scfg->{chapuser}) && !defined($chap_password);
+    my $chapuser = $scfg->{chapuser};
+    my $chap_password = defined($chapuser) ? $get_chap_password->($storeid, $scfg) : undef;
+    die "CHAP is configured for '$storeid' but its password (generation "
+        . ($scfg->{'chap-secret-generation'} // 'legacy') . ") is missing\n"
+        if defined($chapuser) && !defined($chap_password);
 
     for my $portal ($all_portals->($scfg)) {
         my ($host, $port) = $split_portal->($portal);
@@ -698,108 +759,72 @@ my $zfsmp_login_all = sub {
             # Keep a persistent discovery record aligned with the node record.
             # This permits LIO discovery_auth to be enabled without exposing
             # the target inventory to unauthenticated initiators.
-            run_command(
-                [$ISCSIADM, '-m', 'discoverydb', '-t', 'sendtargets', '-p', $pp, '--op', 'new'],
-                noerr => 1, quiet => 1,
-            );
-            my @discovery_settings = defined($scfg->{chapuser})
-                ? (
-                    ['discovery.sendtargets.auth.authmethod', 'CHAP'],
-                    ['discovery.sendtargets.auth.username', $scfg->{chapuser}],
-                    ['discovery.sendtargets.auth.password', $chap_password],
-                )
-                : (
-                    ['discovery.sendtargets.auth.authmethod', 'None'],
-                    ['discovery.sendtargets.auth.username', ''],
-                    ['discovery.sendtargets.auth.password', ''],
-                );
-            for my $nv (@discovery_settings) {
-                my $update_rc = run_command(
-                    [
-                        $ISCSIADM, '-m', 'discoverydb', '-t', 'sendtargets', '-p', $pp,
-                        '--op', 'update', '-n', $nv->[0], '-v', $nv->[1],
-                    ],
-                    noerr => 1, quiet => 1,
-                );
-                die "discovery update '$nv->[0]' failed (rc=$update_rc)\n"
-                    if !defined($update_rc) || $update_rc != 0;
-            }
+            my @disc = ($ISCSIADM, '-m', 'discoverydb', '-t', 'sendtargets', '-p', $pp);
+            $run_ok->([@disc, '--op', 'new']);
+            $iscsi_apply_settings->(\@disc, 'discovery.sendtargets.auth',
+                $chapuser, $chap_password);
 
             if (!$sessions->{$session_key}) {
-                my $discovery_rc = run_command(
-                    [
-                        $ISCSIADM, '-m', 'discoverydb', '-t', 'sendtargets', '-p', $pp,
-                        '--discover',
-                    ],
-                    noerr => 1, quiet => 1,
-                );
-                die "discovery failed (rc=$discovery_rc)\n"
-                    if !defined($discovery_rc) || $discovery_rc != 0;
+                die "discovery failed\n" if !$run_ok->([@disc, '--discover']);
             }
 
-            my @settings = (
+            # NOP-Out detects black-holed links; replacement/login timeouts bound
+            # commands in the SCSI error handler and the initial login.
+            # multipath's fast_io_fail_tmo is the final authority for mapped devs.
+            my @node = ($ISCSIADM, '-m', 'node', '-T', $target, '-p', $pp);
+            $iscsi_apply_settings->(\@node, 'node.session.auth',
+                $chapuser, $chap_password,
                 ['node.startup', 'manual'],
-                # NOP-Out detects black-holed links; replacement_timeout bounds
-                # commands already in the SCSI error handler. multipath's
-                # fast_io_fail_tmo is the final authority for mapped devices.
+                ['node.conn[0].timeo.login_timeout', '8'],
                 ['node.session.timeo.replacement_timeout', '5'],
-                ['node.conn[0].timeo.noop_out_interval', '2'],
-                ['node.conn[0].timeo.noop_out_timeout', '2'],
+                # 2s/2s produced false failure of a healthy path while the
+                # nested target was saturated. 5s/5s still bounds a black hole
+                # but leaves enough scheduling headroom under heavy IO.
+                ['node.conn[0].timeo.noop_out_interval', '5'],
+                ['node.conn[0].timeo.noop_out_timeout', '5'],
             );
-            if (defined($scfg->{chapuser})) {
-                push @settings,
-                    ['node.session.auth.authmethod', 'CHAP'],
-                    ['node.session.auth.username', $scfg->{chapuser}],
-                    ['node.session.auth.password', $chap_password];
-            } else {
-                push @settings,
-                    ['node.session.auth.authmethod', 'None'],
-                    ['node.session.auth.username', ''],
-                    ['node.session.auth.password', ''];
-            }
 
-            for my $nv (@settings) {
-                my $update_rc = run_command(
-                    [
-                        $ISCSIADM, '-m', 'node', '-T', $target, '-p', $pp,
-                        '--op', 'update', '-n', $nv->[0], '-v', $nv->[1],
-                    ],
-                    noerr => 1, quiet => 1,
+            if (my $sid = $sessions->{$session_key}) {
+                # Node records only affect the next login. Apply the safe
+                # runtime values too, so rolling upgrades converge without a
+                # disruptive logout of an in-use multipath session.
+                my @session = ($ISCSIADM, '-m', 'session', '-r', $sid);
+                $iscsi_update_values->(
+                    \@session,
+                    ['node.session.timeo.replacement_timeout', '5'],
+                    ['node.conn[0].timeo.noop_out_interval', '5'],
+                    ['node.conn[0].timeo.noop_out_timeout', '5'],
                 );
-                die "node update '$nv->[0]' failed (rc=$update_rc)\n"
-                    if !defined($update_rc) || $update_rc != 0;
             }
 
             if (!$sessions->{$session_key}) {
-                my $login_rc = run_command(
-                    [$ISCSIADM, '-m', 'node', '-T', $target, '-p', $pp, '--login'],
-                    noerr => 1, quiet => 1,
-                );
-                if (!defined($login_rc) || $login_rc != 0) {
+                if (!$run_ok->([@node, '--login'])) {
                     # PVE workers may activate the same storage concurrently.
                     # Treat a racing login as success once the session exists.
-                    my $appeared = 0;
-                    for (1 .. 10) {
-                        if ($iscsi_sessions->()->{$session_key}) {
-                            $appeared = 1;
-                            last;
-                        }
-                        usleep(100_000);
-                    }
-                    die "login failed (rc=" . (defined($login_rc) ? $login_rc : 'undef') . ")\n"
-                        if !$appeared;
+                    my $appeared = $wait_for->($LOGIN_RACE_TRIES, 100_000, sub {
+                        $iscsi_sessions->()->{$session_key};
+                    });
+                    die "login failed\n" if !$appeared;
                 }
             }
         };
         push @errors, "$pp: $@" if $@;
     }
 
-    warn "zfsiscsimp: iSCSI login issues for target $target: "
-        . join('; ', @errors) . "\n"
+    my $live = $iscsi_sessions->();
+    my $have_session = grep { $live->{lc("$_|$target")} }
+        map { my ($h, $p) = $split_portal->($_); "$h|$p" } $all_portals->($scfg);
+    # A total login failure must not be reported as an active storage: fail
+    # loudly at the source instead of surfacing later as "no local sessions".
+    die "no iSCSI session for target '$target' could be established: " . join('; ', @errors) . "\n"
+        if !$have_session;
+    log_warn("zfsiscsimp: iSCSI login issues for target $target: " . join('; ', @errors))
         if @errors;
 
-    return $iscsi_sessions->();
+    return $live;
 };
+
+# --- sysfs SCSI path plumbing -------------------------------------------------
 
 my $write_sysfs = sub {
     my ($path, $value) = @_;
@@ -851,10 +876,9 @@ my $zfsmp_delete_path_devices = sub {
         push @errors, "$dev: $@" if $@;
     }
 
-    for (1 .. 20) {
-        last if !grep { -e "/sys/block/$_" } keys(%seen);
-        usleep(100_000);
-    }
+    $wait_for->($DELETE_WAIT_TRIES, 100_000, sub {
+        !grep { -e "/sys/block/$_" } keys(%seen);
+    });
     push @errors, map { "$_: device still present after delete" }
         grep { -e "/sys/block/$_" } keys(%seen);
     return \@errors;
@@ -862,6 +886,9 @@ my $zfsmp_delete_path_devices = sub {
 
 # Scan exactly one LUN on each session for this target. This avoids reviving
 # every inactive LUN, which iscsiadm --rescan does for the complete session.
+# $expected_wwid, when set, prunes a stale device that still occupies this
+# H:C:I:L with a different WWID (LIO reuses LUN numbers immediately after free).
+# It is passed only for a freshly resolved identity, never a stale one.
 my $zfsmp_rescan_lun = sub {
     my ($target, $lun, $resize, $expected_wwid) = @_;
     my $matched = 0;
@@ -897,8 +924,7 @@ my $zfsmp_rescan_lun = sub {
             # path can still occupy the same H:C:I:L locally with its old
             # WWID, preventing the new device from being discovered.
             if (!$resize && defined($expected_wwid)) {
-                my @blocks = glob("$scsi_device/block/*");
-                for my $block (@blocks) {
+                for my $block (glob("$scsi_device/block/*")) {
                     next if $block !~ m|/([^/]+)$|;
                     my $dev = $1;
                     my $current_wwid = $zfsmp_block_wwid->($dev);
@@ -930,15 +956,12 @@ sub activate_storage {
     return 1 if $cache->{"zfsiscsimp_active_$storeid"};
     $validate_config->($scfg);
 
-    for my $binary ($ISCSIADM, $MULTIPATH, $MULTIPATHD) {
+    for my $binary ($ISCSIADM, $MULTIPATH, $MULTIPATHD, $BLOCKDEV) {
         die "required executable '$binary' is missing\n" if !-x $binary;
     }
 
-    my $rc = eval {
-        run_command(['systemctl', 'is-active', '--quiet', 'multipathd'], noerr => 1, quiet => 1);
-    };
     die "multipathd is not active on this node - install/enable multipath-tools\n"
-        if !defined($rc) || $rc != 0;
+        if !$run_ok->(['systemctl', 'is-active', '--quiet', 'multipathd'], timeout => 10);
 
     # keep any remote-pool self-healing the parent may add in future
     $class->SUPER::activate_storage($storeid, $scfg, $cache);
@@ -961,70 +984,95 @@ sub activate_volume {
 
     my $identity = $zfsmp_get_identity->($scfg, $name);
     my $wwid = $identity->{wwid};
-    my $add_rc = run_command([$MULTIPATH, '-a', $wwid], noerr => 1, quiet => 1);
-    die "unable to add WWID '$wwid' to the multipath WWIDs file (rc=$add_rc)\n"
-        if !defined($add_rc) || $add_rc != 0;
+    my $expected_wwid = $identity->{stale} ? undef : $wwid;
+    die "unable to add WWID '$wwid' to the multipath WWIDs file\n"
+        if !$run_ok->([$MULTIPATH, '-a', $wwid]);
 
-    my $mapdev = $zfsmp_mapdev->($wwid);
     my $want = scalar($all_portals->($scfg));
+    my $mapdev = $zfsmp_mapdev->($wwid);
     my $current_paths = $mapdev ? $zfsmp_path_count->($wwid) : 0;
-    $zfsmp_rescan_lun->($scfg->{target}, $identity->{lun}, 0, $wwid)
+    $zfsmp_rescan_lun->($scfg->{target}, $identity->{lun}, 0, $expected_wwid)
         if !$mapdev || $current_paths < $want;
 
-    for my $try (1 .. 40) {
-        $mapdev = $zfsmp_mapdev->($wwid);
-        last if $mapdev;
-        # multipathd occasionally misses uevents right after a login/scan
-        if ($try == 4 || $try == 12 || $try == 24) {
-            eval { run_command([$MULTIPATH, $wwid], noerr => 1, quiet => 1) };
+    # Wait for the dm map to appear; nudge multipathd, which occasionally
+    # misses uevents right after a login/scan.
+    $mapdev = $wait_for->($MAP_APPEAR_TRIES, 500_000,
+        sub { $zfsmp_mapdev->($wwid) },
+        sub {
+            my ($try) = @_;
+            $run_ok->([$MULTIPATH, $wwid]) if $try == 4 || $try == 12 || $try == 24;
+        },
+    );
+    if (!$mapdev) {
+        # The map may have failed to appear because a <TTL cache entry in this
+        # worker resolved a WWID that no longer matches (post rollback/realloc).
+        # Drop the cache and re-resolve once before giving up.
+        $zfsmp_forget_wwid->($scfg, $name);
+        my $fresh = $zfsmp_get_identity->($scfg, $name);
+        if ($fresh->{wwid} ne $wwid) {
+            $wwid = $fresh->{wwid};
+            $identity = $fresh;
+            $expected_wwid = $fresh->{stale} ? undef : $wwid;
+            die "unable to add refreshed WWID '$wwid' to the multipath WWIDs file\n"
+                if !$run_ok->([$MULTIPATH, '-a', $wwid]);
+            $zfsmp_rescan_lun->($scfg->{target}, $identity->{lun}, 0, $wwid);
+            $mapdev = $wait_for->($MAP_APPEAR_TRIES, 500_000, sub { $zfsmp_mapdev->($wwid) });
         }
-        usleep(500_000);
+        die "multipath device for wwid '$wwid' did not appear\n" if !$mapdev;
     }
-    die "multipath device for wwid '$wwid' did not appear\n" if !$mapdev;
 
-    my $have = 0;
-    for my $try (1 .. 20) {
-        $have = $zfsmp_path_count->($wwid);
-        last if $have >= $want;
-        # A session can become operational just after the first sysfs scan.
-        # Rescan this LUN (not the whole session) while waiting for redundancy.
-        if ($try == 4 || $try == 10 || $try == 16) {
-            eval { $zfsmp_rescan_lun->($scfg->{target}, $identity->{lun}, 0, $wwid) };
-            warn "zfsiscsimp: retry scan for '$name' failed: $@" if $@;
-        }
-        usleep(500_000);
-    }
+    # Wait for full redundancy; a session can become operational just after the
+    # first sysfs scan, so rescan this LUN (not the whole session) while waiting.
+    my $have = $wait_for->($PATH_REDUNDANCY_TRIES, 500_000,
+        sub { my $n = $zfsmp_path_count->($wwid); $n >= $want ? $n : 0 },
+        sub {
+            my ($try) = @_;
+            return if $try != 4 && $try != 10 && $try != 16;
+            eval {
+                $zfsmp_rescan_lun->(
+                    $scfg->{target}, $identity->{lun}, 0, $expected_wwid,
+                );
+            };
+            log_warn("zfsiscsimp: retry scan for '$name' failed: $@") if $@;
+        },
+    ) // $zfsmp_path_count->($wwid);
     die "multipath map '$wwid' has no usable paths\n" if !$have;
-    warn "zfsiscsimp: volume '$name' active on $have/$want paths (reduced redundancy)\n"
+    log_warn("zfsiscsimp: volume '$name' active on $have/$want paths (reduced redundancy)")
         if $have < $want;
 
     return 1;
 }
 
 # teardown outcomes: 1 = torn down (or nothing to tear down), 0 = map still
-# in use (flush failed) so the caller must abort a destructive operation.
+# in use (flush failed) so a destructive caller must abort. $allow_stale lets
+# a non-destructive caller (deactivate) clean local state during a
+# control-plane outage using a cached identity.
 my $zfsmp_teardown = sub {
-    my ($scfg, $name) = @_;
+    my ($scfg, $name, $allow_stale) = @_;
 
     my $resolved = $zfsmp_resolve_identity->($scfg, $name);
     my $identity;
-    if ($resolved->{status} eq 'absent') {
+    if ($resolved->{status} eq 'ok') {
+        $identity = $resolved->{identity};
+    } elsif ($resolved->{status} eq 'absent') {
         # A successful saveconfig read definitively proved the backstore is
         # gone. If an old identity is cached, use it to remove any local stale
         # map; otherwise there is no target object or local identity to clean.
         $identity = $resolved->{cached_identity};
         if (!defined($identity)) {
-            warn "zfsiscsimp: '$name' has no LIO backstore; nothing to tear down\n";
+            log_warn("zfsiscsimp: '$name' has no LIO backstore; nothing to tear down");
             return 1;
         }
-        warn "zfsiscsimp: '$name' has no LIO backstore; cleaning cached local identity\n";
-    } elsif ($resolved->{status} ne 'ok') {
-        # A target outage or malformed saveconfig is not proof of absence.
-        # Abort before a destructive caller can mistake uncertainty for a
-        # successfully completed teardown.
-        die "refusing to tear down '$name': identity state is unknown: $resolved->{error}\n";
+        log_warn("zfsiscsimp: '$name' has no LIO backstore; cleaning cached local identity");
+    } elsif ($allow_stale && $resolved->{cached_identity}) {
+        # Non-destructive teardown only removes local state; a cached identity
+        # is enough to flush the map and delete this node's paths.
+        $identity = $resolved->{cached_identity};
+        log_warn("zfsiscsimp: tearing down '$name' with a stale identity: $resolved->{error}");
     } else {
-        $identity = $resolved->{identity};
+        # A target outage or malformed saveconfig is not proof of absence.
+        # Abort before a destructive caller mistakes uncertainty for success.
+        die "refusing to tear down '$name': identity state is unknown: $resolved->{error}\n";
     }
     my $wwid = $identity->{wwid};
 
@@ -1043,31 +1091,24 @@ my $zfsmp_teardown = sub {
         # Retry with backoff: on live-migration cleanup the just-exited QEMU and
         # udev can hold the map for a couple of seconds. A genuinely in-use map
         # (running VM) keeps failing and we correctly give up after the window.
-        my $flushed = 0;
-        my $waited = 0;
-        for my $try (1 .. 30) {
-            my $rc = eval { run_command([$MULTIPATH, '-f', $wwid], noerr => 1, quiet => 1) };
-            if ((defined($rc) && $rc == 0) || !$zfsmp_mapdev->($wwid)) {
-                $flushed = 1;
-                last;
-            }
-            my $sleep = $try < 6 ? 300_000 : 600_000; # ~1.5s fast, then ~15s total
-            usleep($sleep);
-            $waited += $sleep;
-        }
+        my $flushed = $wait_for->($FLUSH_TRIES, 0, sub {
+            my $rc = $run_ok->([$MULTIPATH, '-f', $wwid]);
+            ($rc || !$zfsmp_mapdev->($wwid)) ? 1 : 0;
+        }, sub {
+            my ($try) = @_;
+            usleep($try < 6 ? 300_000 : 600_000); # ~1.5s fast, then ~15s total
+        });
         # Do not rip out the paths from under a map still in use.
         return 0 if !$flushed;
     }
 
     # With find_multipaths=strict, removing the WWID prevents future uevents
     # from recreating a map until activate_volume explicitly adds it again.
-    my $forget_rc = run_command([$MULTIPATH, '-w', $wwid], noerr => 1, quiet => 1);
-    return 0 if !defined($forget_rc) || $forget_rc != 0;
+    return 0 if !$run_ok->([$MULTIPATH, '-w', $wwid]);
 
     my $delete_errors = $zfsmp_delete_path_devices->(keys(%paths));
     if (@$delete_errors) {
-        warn "zfsiscsimp: incomplete path cleanup for '$name': "
-            . join('; ', @$delete_errors) . "\n";
+        log_warn("zfsiscsimp: incomplete path cleanup for '$name': " . join('; ', @$delete_errors));
         return 0;
     }
 
@@ -1081,7 +1122,9 @@ sub deactivate_volume {
     die "unable to deactivate snapshot from remote zfs storage\n" if $snapname;
 
     my $name = ($class->parse_volname($volname))[1];
-    my $ok = $zfsmp_teardown->($scfg, $name);
+    # Deactivation only removes local state, so a cached identity is acceptable
+    # when the control plane is briefly unreachable (e.g. migration cleanup).
+    my $ok = $zfsmp_teardown->($scfg, $name, 1);
     die "unable to deactivate '$volname': multipath teardown did not complete\n" if !$ok;
 
     return 1;
@@ -1093,9 +1136,8 @@ sub free_image {
     my ($class, $storeid, $scfg, $volname, $isBase) = @_;
 
     my $name = ($class->parse_volname($volname))[1];
-    my $ok = $zfsmp_teardown->($scfg, $name);
     die "refusing to free '$volname': multipath map still in use, could not flush\n"
-        if defined($ok) && !$ok;
+        if !$zfsmp_teardown->($scfg, $name);
 
     return $class->SUPER::free_image($storeid, $scfg, $volname, $isBase);
 }
@@ -1136,7 +1178,7 @@ sub path {
     die "direct access to snapshots not implemented\n" if defined($snapname);
 
     my ($vtype, $name, $vmid) = $class->parse_volname($volname);
-    my $wwid = $zfsmp_get_wwid->($scfg, $name);
+    my $wwid = $zfsmp_get_identity->($scfg, $name)->{wwid};
 
     # prefer the live map device; fall back to the stable by-id name so a
     # config read succeeds even before activation
@@ -1149,9 +1191,10 @@ sub qemu_blockdev_options {
     my ($class, $scfg, $storeid, $volname, $machine_version, $options) = @_;
 
     # path() returns a block device; the generic implementation maps that to
-    # a 'host_device' blockdev. Bypass ZFSPlugin's libiscsi variant.
-    return PVE::Storage::Plugin::qemu_blockdev_options(
-        $class, $scfg, $storeid, $volname, $machine_version, $options,
+    # a 'host_device' blockdev. Call the grandparent explicitly to bypass
+    # ZFSPlugin's libiscsi variant.
+    return $class->PVE::Storage::Plugin::qemu_blockdev_options(
+        $scfg, $storeid, $volname, $machine_version, $options,
     );
 }
 
@@ -1168,33 +1211,22 @@ sub volume_resize {
 
     # Propagate the new size through each path and verify the final dm size.
     $zfsmp_rescan_lun->($scfg->{target}, $identity->{lun}, 1, $identity->{wwid});
-    my $resized = 0;
-    for (1 .. 10) {
-        my $rc = run_command(
-            [$MULTIPATHD, 'resize', 'map', $identity->{wwid}],
-            noerr => 1,
-            quiet => 1,
-        );
-        if (defined($rc) && $rc == 0) {
-            $resized = 1;
-            last;
-        }
-        usleep(300_000);
-    }
+    my $resized = $wait_for->($RESIZE_TRIES, 300_000, sub {
+        $run_ok->([$MULTIPATHD, 'resize', 'map', $identity->{wwid}]);
+    });
     die "zvol '$name' was resized, but multipathd could not resize map '$identity->{wwid}'\n"
         if !$resized;
 
     my $actual = '';
-    my $size_rc = run_command(
+    my $size_ok = $run_ok->(
         [$BLOCKDEV, '--getsize64', $mapdev],
-        noerr => 1,
-        quiet => 1,
         outfunc => sub { $actual .= $_[0] },
     );
+    $actual =~ s/\s+//g;
     my $expected = $new_size * 1024;
-    die "zvol '$name' was resized, but map size verification failed (rc=$size_rc, "
-        . "actual='$actual', expected='$expected')\n"
-        if !defined($size_rc) || $size_rc != 0 || $actual !~ /^\d+$/ || $actual != $expected;
+    die "zvol '$name' was resized, but map size verification failed "
+        . "(actual='$actual', expected='$expected')\n"
+        if !$size_ok || $actual !~ /^\d+$/ || $actual != $expected;
 
     return $new_size;
 }
