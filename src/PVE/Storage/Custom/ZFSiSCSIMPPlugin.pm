@@ -14,7 +14,7 @@ package PVE::Storage::Custom::ZFSiSCSIMPPlugin;
 use strict;
 use warnings;
 
-use JSON qw(decode_json);
+use JSON qw(decode_json encode_json);
 use Time::HiRes qw(usleep);
 
 use PVE::Tools qw(file_read_firstline file_set_contents run_command);
@@ -22,6 +22,8 @@ use PVE::Storage::Plugin;
 use PVE::Storage::ZFSPlugin;
 
 use base qw(PVE::Storage::ZFSPlugin);
+
+our $VERSION = '0.3.3';
 
 # ZFS over iSCSI with the kernel initiator and dm-multipath.
 #
@@ -57,6 +59,8 @@ my $BLOCKDEV = '/usr/sbin/blockdev';
 
 sub type { return 'zfsiscsimp'; }
 
+sub plugin_version { return $VERSION; }
+
 sub plugindata {
     return {
         content => [{ images => 1 }, { images => 1 }],
@@ -79,6 +83,11 @@ sub properties {
             type => 'string',
             pattern => '[^\\s:]{1,223}',
         },
+        'chap-secret-generation' => {
+            description => "Internal generation that atomically binds storage.cfg to a CHAP secret.",
+            type => 'string',
+            pattern => '[0-9a-f]{32}',
+        },
     };
 }
 
@@ -99,6 +108,7 @@ sub options {
         comstar_tg => { optional => 1 },
         lio_tpg => { fixed => 1 },
         chapuser => { optional => 1 },
+        'chap-secret-generation' => { optional => 1 },
         password => { optional => 1 },
         content => { optional => 1 },
         bwlimit => { optional => 1 },
@@ -169,24 +179,94 @@ my $chap_password_file = sub {
     return "/etc/pve/priv/storage/${storeid}.zfsiscsimp-chap";
 };
 
-my $set_chap_password = sub {
-    my ($storeid, $password) = @_;
-    my $path = $chap_password_file->($storeid);
-    mkdir '/etc/pve/priv/storage';
-    if (defined($password)) {
-        die "CHAP password must contain between 12 and 255 characters\n"
-            if length($password) < 12 || length($password) > 255;
-        file_set_contents($path, "$password\n", 0600, 1);
-    } elsif (-e $path) {
-        unlink($path) or die "unable to remove CHAP password '$path': $!\n";
-    }
+my $CHAP_SECRET_PREFIX = 'zfsiscsimp-secret-v1:';
+
+my $validate_chap_password = sub {
+    my ($password) = @_;
+    die "CHAP password must contain between 12 and 255 characters\n"
+        if !defined($password) || length($password) < 12 || length($password) > 255;
+    die "CHAP password must not contain control characters\n"
+        if $password =~ /[\x00-\x1f\x7f]/;
 };
 
-my $get_chap_password = sub {
+my $new_chap_generation = sub {
+    open(my $urandom, '<', '/dev/urandom')
+        or die "unable to open /dev/urandom for CHAP generation: $!\n";
+    my $bytes = '';
+    my $read = read($urandom, $bytes, 16);
+    close($urandom);
+    die "unable to read a CHAP generation from /dev/urandom\n"
+        if !defined($read) || $read != 16;
+    return unpack('H*', $bytes);
+};
+
+my $read_chap_record = sub {
     my ($storeid) = @_;
     my $path = $chap_password_file->($storeid);
     return undef if !-e $path;
-    return file_read_firstline($path);
+
+    my $raw = file_read_firstline($path);
+    return undef if !defined($raw);
+
+    # Upgrade legacy 0.2.x plaintext files lazily. They remain readable until
+    # the next password rotation creates a generation-bound record.
+    return { legacy => $raw } if index($raw, $CHAP_SECRET_PREFIX) != 0;
+
+    my $json = substr($raw, length($CHAP_SECRET_PREFIX));
+    my $record = eval { decode_json($json) };
+    die "CHAP secret record '$path' is corrupt: " . ($@ || 'invalid structure') . "\n"
+        if !defined($record) || ref($record) ne 'HASH'
+        || ref($record->{secrets}) ne 'HASH';
+    return $record->{secrets};
+};
+
+my $write_chap_record = sub {
+    my ($storeid, $secrets) = @_;
+    my $dir = '/etc/pve/priv/storage';
+    mkdir($dir) if !-d $dir;
+    die "unable to create CHAP secret directory '$dir': $!\n" if !-d $dir;
+
+    my $path = $chap_password_file->($storeid);
+    my $payload = $CHAP_SECRET_PREFIX . encode_json({ secrets => $secrets }) . "\n";
+    # file_set_contents is already atomic (tmp+rename); its 4th positional arg
+    # is force_utf8, which would double-encode the already-UTF-8 JSON payload
+    # and silently corrupt non-ASCII CHAP secrets. Never pass it here.
+    # No extra locking needed: the add/update hooks run under the cfs storage
+    # lock and the write is an atomic rename.
+    file_set_contents($path, $payload, 0600);
+};
+
+my $get_chap_password = sub {
+    my ($storeid, $scfg) = @_;
+    my $secrets = $read_chap_record->($storeid);
+    return undef if !defined($secrets);
+
+    my $generation = $scfg->{'chap-secret-generation'};
+    return $secrets->{$generation} if defined($generation);
+    return $secrets->{legacy};
+};
+
+my $stage_chap_password = sub {
+    my ($storeid, $scfg, $password) = @_;
+    $validate_chap_password->($password);
+
+    # Keep exactly the currently committed password and the proposed one.
+    # Before storage.cfg commits, readers select the old generation; after it
+    # commits, they select the new generation. A failed pmxcfs write therefore
+    # cannot switch authentication credentials underneath the old config.
+    my %secrets;
+    if (defined($scfg)) {
+        my $current = $get_chap_password->($storeid, $scfg);
+        if (defined($current)) {
+            my $key = $scfg->{'chap-secret-generation'} // 'legacy';
+            $secrets{$key} = $current;
+        }
+    }
+
+    my $generation = $new_chap_generation->();
+    $secrets{$generation} = $password;
+    $write_chap_record->($storeid, \%secrets);
+    return $generation;
 };
 
 my $ssh_key_for_host = sub {
@@ -275,10 +355,17 @@ sub zfs_request {
 
 sub on_add_hook {
     my ($class, $storeid, $scfg, %sensitive) = @_;
+    die "chap-secret-generation is managed internally; provide password instead\n"
+        if defined($scfg->{'chap-secret-generation'});
     $validate_config->($scfg);
     die "chapuser requires a password\n"
         if defined($scfg->{chapuser}) && !defined($sensitive{password});
-    $set_chap_password->($storeid, $sensitive{password});
+    die "password requires chapuser\n"
+        if !defined($scfg->{chapuser}) && defined($sensitive{password});
+    if (defined($sensitive{password})) {
+        $scfg->{'chap-secret-generation'} =
+            $stage_chap_password->($storeid, undef, $sensitive{password});
+    }
 
     my $selected = $select_control_scfg->($scfg);
     $class->SUPER::on_add_hook($storeid, $selected);
@@ -289,6 +376,16 @@ sub on_add_hook {
 
 sub on_update_hook_full {
     my ($class, $storeid, $scfg, $update, $delete, $sensitive) = @_;
+    if (!defined($delete)) {
+        $delete = [];
+        $_[4] = $delete; # let the API apply internal post-hook deletions
+    }
+
+    die "chap-secret-generation is managed internally; update password instead\n"
+        if exists($update->{'chap-secret-generation'});
+    my $deletes_generation = grep { $_ eq 'chap-secret-generation' } @$delete;
+    die "chap-secret-generation is managed internally; delete password instead\n"
+        if $deletes_generation && !exists($sensitive->{password});
 
     my $merged = { %$scfg, %$update };
     delete $merged->{$_} for @$delete;
@@ -298,20 +395,43 @@ sub on_update_hook_full {
     # mutating the secret file: deleting the password while chapuser stays
     # must be rejected without first unlinking the secret (which is
     # cluster-wide via pmxcfs and would brick activation on every node).
-    my $password_after = exists($sensitive->{password})
-        ? $sensitive->{password}
-        : $get_chap_password->($storeid);
-    die "chapuser requires a stored password\n"
-        if defined($merged->{chapuser}) && !defined($password_after);
+    my $password_after;
+    if (defined($merged->{chapuser})) {
+        $password_after = exists($sensitive->{password})
+            ? $sensitive->{password}
+            : (defined($scfg->{chapuser}) ? $get_chap_password->($storeid, $scfg) : undef);
+        die "chapuser requires a stored password\n" if !defined($password_after);
+    } else {
+        die "password requires chapuser\n"
+            if exists($sensitive->{password}) && defined($sensitive->{password});
+        # Removing chapuser also detaches the committed generation. The secret
+        # record itself stays until post-commit garbage collection.
+        push @$delete, 'chap-secret-generation'
+            if defined($scfg->{'chap-secret-generation'}) && !$deletes_generation;
+    }
 
-    $set_chap_password->($storeid, $sensitive->{password})
-        if exists($sensitive->{password});
+    if (exists($sensitive->{password})) {
+        if (defined($sensitive->{password})) {
+            my $generation = $stage_chap_password->($storeid, $scfg, $sensitive->{password});
+            $update->{'chap-secret-generation'} = $generation;
+            @$delete = grep { $_ ne 'chap-secret-generation' } @$delete;
+        } else {
+            # Do not unlink the old secret before storage.cfg commits. Once
+            # chapuser and its generation disappear it is unreachable; an
+            # explicit secret GC can safely remove the orphan later.
+            push @$delete, 'chap-secret-generation'
+                if !grep { $_ eq 'chap-secret-generation' } @$delete;
+        }
+    }
     return;
 }
 
 sub on_delete_hook {
     my ($class, $storeid, $scfg) = @_;
-    $set_chap_password->($storeid, undef);
+    # This hook runs before storage.cfg commits. Removing the secret here would
+    # leave a still-configured storage unusable if the pmxcfs write then failed.
+    # Keep the mode-0600 orphan; zfsiscsimp-preflight --cleanup-secrets removes
+    # it only after it can prove the storage ID no longer exists.
     return;
 }
 
@@ -379,76 +499,110 @@ my $backstore_name = sub {
     return "$prefix-$volname";
 };
 
-my $zfsmp_get_identity = sub {
+my $zfsmp_resolve_identity = sub {
     my ($scfg, $volname) = @_;
 
     my $bsname = $backstore_name->($scfg, $volname);
     my $cachekey = "$scfg->{target}/$bsname";
     my $entry = $identity_cache->{$cachekey};
-    return $entry if $entry && time() - $entry->{time} < $IDENTITY_CACHE_TTL;
+    return { status => 'ok', identity => $entry }
+        if $entry && time() - $entry->{time} < $IDENTITY_CACHE_TTL;
 
     my $config = $read_saveconfig->($scfg);
-    my $identity = eval {
-        die "unable to read the LIO saveconfig from any portal of '$scfg->{target}'\n"
-            if !defined($config);
+    return {
+        status => 'unavailable',
+        cached_identity => $entry,
+        error => "unable to read the LIO saveconfig from any portal of '$scfg->{target}'",
+    } if !defined($config);
+    return {
+        status => 'invalid',
+        cached_identity => $entry,
+        error => "LIO saveconfig for '$scfg->{target}' has no storage_objects array",
+    } if ref($config) ne 'HASH' || ref($config->{storage_objects}) ne 'ARRAY';
 
-        my ($serial, $actual_bsname);
-        for my $so (@{ $config->{storage_objects} // [] }) {
-            next if !defined($so->{name}) || !defined($so->{wwn});
-            next if defined($so->{plugin}) && $so->{plugin} ne 'block';
-            if ($so->{name} eq $bsname) {
-                ($serial, $actual_bsname) = ($so->{wwn}, $bsname);
-                last;
-            }
-            # legacy backstores created without the pool prefix
-            if ($so->{name} eq $volname && !defined($serial)) {
-                ($serial, $actual_bsname) = ($so->{wwn}, $volname);
-            }
+    my ($serial, $actual_bsname);
+    for my $so (@{ $config->{storage_objects} }) {
+        next if ref($so) ne 'HASH';
+        next if !defined($so->{name}) || !defined($so->{wwn});
+        next if defined($so->{plugin}) && $so->{plugin} ne 'block';
+        if ($so->{name} eq $bsname) {
+            ($serial, $actual_bsname) = ($so->{wwn}, $bsname);
+            last;
         }
-        die "backstore for volume '$volname' not found on target '$scfg->{target}'\n"
-            if !defined($serial);
-
-        my $hex = lc($serial);
-        $hex =~ s/[^0-9a-f]//g;
-        die "unit serial '$serial' of volume '$volname' is too short for a NAA id\n"
-            if length($hex) < 25;
-
-        my ($tpg_tag) = $scfg->{lio_tpg} =~ /^tpg(\d+)$/;
-        my $lun;
-        TARGET:
-        for my $target (@{ $config->{targets} // [] }) {
-            next if ($target->{fabric} // '') ne 'iscsi';
-            next if ($target->{wwn} // '') ne $scfg->{target};
-            for my $tpg (@{ $target->{tpgs} // [] }) {
-                next if !defined($tpg->{tag}) || $tpg->{tag} != $tpg_tag;
-                for my $candidate (@{ $tpg->{luns} // [] }) {
-                    next if ($candidate->{storage_object} // '')
-                        ne "/backstores/block/$actual_bsname";
-                    $lun = $candidate->{index};
-                    last TARGET;
-                }
-            }
+        # legacy backstores created without the pool prefix
+        if ($so->{name} eq $volname && !defined($serial)) {
+            ($serial, $actual_bsname) = ($so->{wwn}, $volname);
         }
-        die "LUN for backstore '$actual_bsname' not found in $scfg->{lio_tpg}\n"
-            if !defined($lun) || $lun !~ /^\d+$/;
-
-        {
-            time => time(),
-            wwid => '36001405' . substr($hex, 0, 25),
-            lun => int($lun),
-        };
-    };
-    if (!defined($identity)) {
-        my $err = $@ || 'unknown identity parsing error';
-        if ($entry) {
-            warn "zfsiscsimp: using stale cached identity for '$volname': $err";
-            return $entry;
-        }
-        die $err;
     }
+    return {
+        status => 'absent',
+        cached_identity => $entry,
+        error => "backstore for volume '$volname' not found on target '$scfg->{target}'",
+    } if !defined($serial);
 
+    my $hex = lc($serial);
+    $hex =~ s/[^0-9a-f]//g;
+    return {
+        status => 'invalid',
+        cached_identity => $entry,
+        error => "unit serial '$serial' of volume '$volname' is too short for a NAA id",
+    } if length($hex) < 25;
+
+    return {
+        status => 'invalid',
+        cached_identity => $entry,
+        error => "LIO saveconfig for '$scfg->{target}' has no targets array",
+    } if ref($config->{targets}) ne 'ARRAY';
+
+    my ($tpg_tag) = $scfg->{lio_tpg} =~ /^tpg(\d+)$/;
+    my $lun;
+    TARGET:
+    for my $target (@{ $config->{targets} }) {
+        next if ref($target) ne 'HASH';
+        next if ($target->{fabric} // '') ne 'iscsi';
+        next if ($target->{wwn} // '') ne $scfg->{target};
+        next if ref($target->{tpgs}) ne 'ARRAY';
+        for my $tpg (@{ $target->{tpgs} }) {
+            next if ref($tpg) ne 'HASH';
+            next if !defined($tpg->{tag}) || $tpg->{tag} != $tpg_tag;
+            next if ref($tpg->{luns}) ne 'ARRAY';
+            for my $candidate (@{ $tpg->{luns} }) {
+                next if ref($candidate) ne 'HASH';
+                next if ($candidate->{storage_object} // '')
+                    ne "/backstores/block/$actual_bsname";
+                $lun = $candidate->{index};
+                last TARGET;
+            }
+        }
+    }
+    return {
+        status => 'invalid',
+        cached_identity => $entry,
+        error => "LUN for backstore '$actual_bsname' not found in $scfg->{lio_tpg}",
+    } if !defined($lun) || $lun !~ /^\d+$/;
+
+    my $identity = {
+        time => time(),
+        wwid => '36001405' . substr($hex, 0, 25),
+        lun => int($lun),
+    };
     $identity_cache->{$cachekey} = $identity;
-    return $identity;
+    return { status => 'ok', identity => $identity };
+};
+
+my $zfsmp_get_identity = sub {
+    my ($scfg, $volname) = @_;
+    my $resolved = $zfsmp_resolve_identity->($scfg, $volname);
+    return $resolved->{identity} if $resolved->{status} eq 'ok';
+
+    # A stale identity is useful for keeping an already-attached volume
+    # operational during a transient control-plane outage. Never use it when
+    # the target definitively reports the backstore absent or structurally bad.
+    if ($resolved->{status} eq 'unavailable' && $resolved->{cached_identity}) {
+        warn "zfsiscsimp: using stale cached identity for '$volname': $resolved->{error}\n";
+        return $resolved->{cached_identity};
+    }
+    die "$resolved->{error}\n";
 };
 
 my $zfsmp_get_wwid = sub {
@@ -530,7 +684,9 @@ my $zfsmp_login_all = sub {
     my $target = $scfg->{target};
     my $sessions = $iscsi_sessions->();
     my @errors;
-    my $chap_password = defined($scfg->{chapuser}) ? $get_chap_password->($storeid) : undef;
+    my $chap_password = defined($scfg->{chapuser})
+        ? $get_chap_password->($storeid, $scfg)
+        : undef;
     die "CHAP is configured for '$storeid' but its password file is missing\n"
         if defined($scfg->{chapuser}) && !defined($chap_password);
 
@@ -850,16 +1006,27 @@ sub activate_volume {
 my $zfsmp_teardown = sub {
     my ($scfg, $name) = @_;
 
-    my $wwid = eval { $zfsmp_get_wwid->($scfg, $name) };
-    if (!defined($wwid)) {
-        # The backstore is gone (deleted LUN, half-finished free, out-of-band
-        # removal). There is nothing on the target to identify local paths by,
-        # and an attached volume would still have its backstore, so this is not
-        # a "map busy" condition: let the caller proceed to destroy the zvol.
-        warn "zfsiscsimp: '$name' has no LIO backstore; nothing to tear down"
-            . ($@ ? " ($@)" : "") . "\n";
-        return 1;
+    my $resolved = $zfsmp_resolve_identity->($scfg, $name);
+    my $identity;
+    if ($resolved->{status} eq 'absent') {
+        # A successful saveconfig read definitively proved the backstore is
+        # gone. If an old identity is cached, use it to remove any local stale
+        # map; otherwise there is no target object or local identity to clean.
+        $identity = $resolved->{cached_identity};
+        if (!defined($identity)) {
+            warn "zfsiscsimp: '$name' has no LIO backstore; nothing to tear down\n";
+            return 1;
+        }
+        warn "zfsiscsimp: '$name' has no LIO backstore; cleaning cached local identity\n";
+    } elsif ($resolved->{status} ne 'ok') {
+        # A target outage or malformed saveconfig is not proof of absence.
+        # Abort before a destructive caller can mistake uncertainty for a
+        # successfully completed teardown.
+        die "refusing to tear down '$name': identity state is unknown: $resolved->{error}\n";
+    } else {
+        $identity = $resolved->{identity};
     }
+    my $wwid = $identity->{wwid};
 
     my $mapdev = $zfsmp_mapdev->($wwid);
 
