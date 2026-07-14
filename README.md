@@ -11,7 +11,8 @@ No convierte un único servidor ZFS/LIO en storage HA: para tolerar la caída co
 target hace falta otra arquitectura (controladoras/targets redundantes o un backend
 distribuido) — eso es arquitectónico, no del plugin.
 
-Documentación: [diseño](docs/DESIGN.md) y [resultados reproducibles](docs/RESULTS.md).
+Documentación: [diseño](docs/DESIGN.md), [resultados reproducibles](docs/RESULTS.md) y
+[runbook de upgrades](docs/UPGRADES.md).
 
 ## Requisitos
 
@@ -30,14 +31,23 @@ Documentación: [diseño](docs/DESIGN.md) y [resultados reproducibles](docs/RESU
 
 ## Instalación
 
-En cada nodo PVE:
+Preferido, en cada nodo PVE drenado/en mantenimiento:
+
+```bash
+bash packaging/build-deb.sh
+sudo apt install ../pve-storage-zfsiscsimp_0.3.3_all.deb
+sudo zfsiscsimp-preflight --local-only
+```
+
+Instalación directa desde el checkout (también transaccional):
 
 ```bash
 sudo ./install.sh
 ```
 
-El instalador valida Perl/API antes de recargar PVE, conserva una copia timestamped y
-restaura automáticamente el plugin previo si falla el loader o un daemon. Si ya existe
+El instalador usa un lock, valida Perl/API antes de recargar PVE, conserva un historial
+acotado y restaura plugin, preflight y multipath ante error o señal. No instala dependencias
+implícitamente. Si ya existe
 `/etc/multipath.conf`, no lo reemplaza: compararlo con
 `conf/multipath.conf.example` y validar con `multipath -t` antes del reload.
 
@@ -72,6 +82,8 @@ pvesm set mp-storage --chapuser pve-initiator --password 'secreto-largo'
 Queda en `/etc/pve/priv/storage/mp-storage.zfsiscsimp-chap`, modo `0600`. El mismo
 usuario/secreto debe configurarse en el ACL del initiator y en `discovery_auth` de LIO.
 Los node records ya conectados deben reloguearse después de cambiar timers o CHAP.
+Desde 0.3.0 el archivo contiene generaciones: `storage.cfg` selecciona la credencial
+committed y una falla posterior del commit no activa prematuramente el secreto nuevo.
 
 OpenZFS 2.2+ usa 16 KiB como default equilibrado. Para guests 4K random puede convenir
 `blocksize 4k`, con mayor metadata/menor eficiencia de espacio; medir en el pool real.
@@ -101,6 +113,10 @@ sudo env CONFIRM_DESTRUCTIVE=YES bash tests/03-resize-and-vm.sh
 sudo env CONFIRM_DESTRUCTIVE=YES bash tests/04-control-plane.sh
 sudo env CONFIRM_DESTRUCTIVE=YES bash tests/05-security.sh
 sudo env CONFIRM_DESTRUCTIVE=YES bash tests/06-target-reboot.sh
+sudo env CONFIRM_DESTRUCTIVE=YES bash tests/07-identity-fail-closed.sh
+sudo env CONFIRM_DESTRUCTIVE=YES bash tests/08-chap-transaction.sh
+sudo env CONFIRM_DESTRUCTIVE=YES RUN_DESTRUCTIVE=1 bash tests/09-upgrade-gate.sh
+sudo env CONFIRM_DESTRUCTIVE=YES bash tests/10-rate-limited-performance.sh
 ```
 
 El benchmark puede limitar cada fabric virtual sin tocar management. Aplica `tc` en
@@ -114,6 +130,9 @@ sudo env CONFIRM_DESTRUCTIVE=YES RATE_LIMIT_MBIT=100 bash tests/01-perf.sh
 single bloquea un portal y espera exactamente un path usable, por lo que `pvestatd` no
 puede sesgar el resultado relogueando la sesión durante la medición.
 
+`10-rate-limited-performance.sh` es el gate corto: compara el mismo dm-map con uno y dos
+paths de 100 Mbit/s y falla si lectura o escritura no escalan al menos 1,50×.
+
 Los traps quitan reglas de firewall y liberan sólo el volumen que el test creó. Los tests
 que cierran una sesión o reinician el target se niegan a correr si una VM activa usa el
 storage.
@@ -121,9 +140,10 @@ storage.
 ## Límites que siguen siendo arquitectónicos
 
 - Un solo host ZFS/LIO es un SPOF aunque tenga dos redes.
-- `shared 1` habilita semántica HA/migration, pero falta certificación multi-node.
-- Es un plugin fuera del core; cada upgrade de `libpve-storage-perl` requiere repetir
-  compile/load/smoke contra el nuevo `PVE::Storage::APIVER`.
+- Migración y recovery HA están certificados en dos nodos con QDevice, no en clusters
+  mayores ni fabrics/switches físicos.
+- Es un plugin fuera del core; `APIVER/APIAGE` sólo valida el loader. Cada upgrade de
+  `libpve-storage-perl` requiere preflight, lifecycle y canario según `docs/UPGRADES.md`.
 - Los números del lab anidado no dimensionan hardware físico.
 
 Licencia: AGPL-3.0-or-later; deriva de `PVE::Storage::ZFSPlugin`.

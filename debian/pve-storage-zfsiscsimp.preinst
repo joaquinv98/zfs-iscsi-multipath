@@ -1,0 +1,24 @@
+#!/bin/bash
+set -e
+
+STATE_DIR=/var/lib/pve-storage-zfsiscsimp/preinst
+
+case "${1:-}" in
+    install|upgrade)
+        rm -rf -- "$STATE_DIR"
+        install -d -m 0700 "$STATE_DIR"
+        if [ -f /usr/share/perl5/PVE/Storage/Custom/ZFSiSCSIMPPlugin.pm ]; then
+            cp -a /usr/share/perl5/PVE/Storage/Custom/ZFSiSCSIMPPlugin.pm \
+                "$STATE_DIR/plugin.backup"
+            : >"$STATE_DIR/plugin.had-original"
+        fi
+        if [ -f /usr/sbin/zfsiscsimp-preflight ]; then
+            cp -a /usr/sbin/zfsiscsimp-preflight "$STATE_DIR/preflight.backup"
+            : >"$STATE_DIR/preflight.had-original"
+        fi
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

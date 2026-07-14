@@ -83,6 +83,11 @@ Con un cuello independiente por fabric, multipath agregó prácticamente el 100%
 enlace. Los p99 secuenciales altos son esperables con QD32 y bloques de 1 MiB contra links
 de 100 Mbit/s: hay decenas de MiB pendientes detrás del shaper.
 
+El gate autocontenido `tests/10-rate-limited-performance.sh` repitió la condición al cerrar
+0.3.2: write 11.41→22.81 MiB/s y read 11.40→22.76 MiB/s, exactamente 2.00× en ambos casos.
+El primer intento además validó el rollback del test: ante un error de parser restauró link
+y qdiscs y eliminó el zvol scratch sin dejar maps.
+
 ## Cluster de 2 nodos y migración en vivo (2026-07-14)
 
 Se montó un cluster PVE real de 2 nodos anidados (`pvenest01` .34.14, `pvenest02` .34.16,
@@ -152,6 +157,50 @@ Resumen HA:
 | VM recuperada con disco multipath y 2 paths | PASS |
 | guest cold-boot en el nodo superviviente | PASS |
 
+## Upgrade hardening 0.3.0–0.3.3 (2026-07-14)
+
+El rollout se hizo rolling sobre el mismo cluster, manteniendo `vm:8888` en el nodo opuesto
+durante instalación/reboot y usándola como canario de migración al terminar.
+
+| Prueba | Resultado |
+|---|---|
+| Perl real PVE + `bash -n` + `shellcheck` | PASS, sin hallazgos |
+| contrato upstream certificado (commit `d666ebd6`, API 15/age 6) | PASS |
+| build Debian `pve-storage-zfsiscsimp_0.3.3_all.deb` | PASS |
+| preflight local en ambos nodos | PASS, 0 warnings |
+| preflight cluster (versión/API/SHA/paquete/PVE) | PASS |
+| CHAP: hook ejecutado sin commit de `storage.cfg` | PASS, siguió seleccionando secreto anterior |
+| conversión real CHAP legacy→generación (misma credencial) | PASS en ambos nodos |
+| ambos portales bloqueados durante `pvesm free` | PASS, operación rechazada y zvol preservado |
+| checksum tras `free` rechazado | PASS, SHA256 idéntico sobre 64 MiB |
+| rollback inyectando paquete con `api=999` | PASS, restauró SHA anterior y storage activo |
+| reinstall del paquete válido después del rollback | PASS, `dpkg` estado `ii` |
+| remoción del paquete con `mptest` configurado | PASS, archivos protegidos; estado `ri` detectado y normalizado a `ii` por reinstall |
+| benchmark gate 1×100 vs 2×100 Mbit/s | PASS, 2.00× read y write; cleanup 0 residual |
+| actualización rolling de dependencias pendientes | PASS, 0 paquetes pendientes en ambos nodos |
+| reboot frío de ambos nodos | PASS después de persistir hostname no-loopback |
+| migraciones canarias durante/después del rollout | PASS, VM vuelve a `pvenest02` |
+| teardown del origen final | PASS, `pvenest01` sin maps |
+| destino final | PASS, `dm-0` con 2 paths `active ready running` |
+
+El test fail-closed encontró la distinción buscada: con `10.90.1.11` y `10.90.2.11`
+blackholeados, la identidad quedó **unknown**, `pvesm free` devolvió error y el zvol siguió
+enumerable. Al restaurar la red, el map recuperó dos paths y el checksum fue
+`70f9d4a7…a9dee5`; el cleanup posterior dejó 0 residuales.
+
+El rollout también destapó tres problemas de host/cluster que ahora cubre el preflight:
+
+1. `pvenest02` tenía `pve-enterprise` sin suscripción junto a `pve-no-subscription`; `apt
+   update` terminaba 401. En el lab se deshabilitó enterprise y se dejó una sola familia.
+2. cloud-init regeneró `/etc/hosts` de `pvenest02` como `127.0.1.1`; pmxcfs no arrancó tras
+   reboot. Se fijaron ambos nombres/IP y `manage_etc_hosts: false` en los dos nodos.
+3. faltaban las host keys de `pvenest02` y su symlink `/etc/ssh/ssh_known_hosts`; se tomaron
+   las claves públicas por SSH autenticado, se agregaron a pmxcfs y se restauró el symlink.
+
+Estado final: paquete 0.3.3 `ii` en ambos nodos, plugin SHA256 `8b017486…f61ec343`,
+`libpve-storage-perl` 9.1.6, VM HA 8888 corriendo en `pvenest02`, quórum
+y fencing armados, cero updates pendientes.
+
 ## Kernel patch
 
 - Runtime GET LBA STATUS: 8 passed, 0 failed.
@@ -166,5 +215,5 @@ Resumen HA:
 - Todo en un solo host físico (hvarres03) con bridges internos: la agregación real y el
   aislamiento de fallas de red necesitan 2 NICs/switches físicos.
 - Comportamiento y capacidad en NICs, switches y vdevs físicos del destino.
-- Compatibilidad futura del plugin custom después de un cambio de API de PVE (el instalador
-  ahora valida contra la ventana APIVER/APIAGE, pero cada upgrade de PVE requiere re-verificar).
+- Compatibilidad futura del plugin custom después de cambios de PVE: API window, sentinel y
+  preflight reducen el riesgo, pero cada versión nueva aún requiere el gate funcional/canario.

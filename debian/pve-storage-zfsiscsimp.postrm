@@ -1,0 +1,15 @@
+#!/bin/bash
+set -e
+
+# Long-running PVE processes cache the storage registry. Refresh them after a
+# removal too, but never hide the package operation if a service is absent.
+if [ "${1:-}" = remove ] || [ "${1:-}" = purge ]; then
+    for service in pvedaemon pveproxy pvestatd pvescheduler pve-ha-lrm pve-ha-crm; do
+        systemctl cat "${service}.service" >/dev/null 2>&1 || continue
+        systemctl reload-or-restart "$service" || true
+    done
+fi
+
+#DEBHELPER#
+
+exit 0

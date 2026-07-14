@@ -1,0 +1,22 @@
+#!/bin/bash
+set -e
+
+case "${1:-}" in
+    remove)
+        # Removing the module while storage.cfg still references its type makes
+        # every long-running PVE consumer lose that storage on its next reload.
+        perl -MPVE::Storage -e '
+            my $cfg = PVE::Storage::config();
+            my @ids = sort grep {
+                ($cfg->{ids}->{$_}->{type} // "") eq "zfsiscsimp"
+            } keys %{$cfg->{ids}};
+            die "refusing package removal while zfsiscsimp storage exists: @ids; "
+                . "reinstall the approved .deb if dpkg records a remove selection\n"
+                if @ids;
+        '
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

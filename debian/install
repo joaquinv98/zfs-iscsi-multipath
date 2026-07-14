@@ -1,0 +1,2 @@
+src/PVE/Storage/Custom/ZFSiSCSIMPPlugin.pm usr/share/perl5/PVE/Storage/Custom
+bin/zfsiscsimp-preflight usr/sbin

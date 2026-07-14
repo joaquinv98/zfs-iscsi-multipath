@@ -1,0 +1,34 @@
+pve-storage-zfsiscsimp (0.3.3) stable; urgency=medium
+
+  * Accept dpkg Status-Abbrev padding while still requiring the ii state.
+  * Certify the real ii-to-ri-to-ii blocked-removal recovery path.
+  * Publish a new immutable version after the 0.3.2 laboratory builds.
+
+ -- Joaquin Varela <joaquinv898@gmail.com>  Tue, 14 Jul 2026 14:10:00 -0300
+
+pve-storage-zfsiscsimp (0.3.2) stable; urgency=medium
+
+  * Reject dpkg desired/status skew such as the ri state after a blocked removal.
+  * Add a self-cleaning 1x100 versus 2x100 Mbit/s performance gate.
+  * Use a new immutable package and plugin version after the 0.3.1 lab builds.
+
+ -- Joaquin Varela <joaquinv898@gmail.com>  Tue, 14 Jul 2026 14:00:00 -0300
+
+pve-storage-zfsiscsimp (0.3.1) stable; urgency=medium
+
+  * Check persistent hostname resolution, cluster known_hosts and APT repo skew.
+  * Include package version in cluster skew detection.
+  * Declare the directly used JSON Perl module as a package dependency.
+  * Refuse package removal while a zfsiscsimp storage is still configured.
+  * Certify package rollback, rolling package updates and cold reboot recovery.
+
+ -- Joaquin Varela <joaquinv898@gmail.com>  Tue, 14 Jul 2026 13:40:00 -0300
+
+pve-storage-zfsiscsimp (0.3.0) stable; urgency=medium
+
+  * Add fail-closed identity resolution for destructive operations.
+  * Bind CHAP secrets transactionally to storage.cfg generations.
+  * Add node and cluster upgrade preflight gates.
+  * Add transactional manual installation and Debian packaging.
+
+ -- Joaquin Varela <joaquinv898@gmail.com>  Tue, 14 Jul 2026 12:00:00 -0300

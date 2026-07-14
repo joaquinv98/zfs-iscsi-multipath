@@ -1,0 +1,35 @@
+name: compatibility
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: '17 6 * * 1'
+
+jobs:
+  static-and-package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install validation dependencies
+        run: sudo apt-get update && sudo apt-get install -y debhelper devscripts libjson-perl shellcheck
+      - name: Shell syntax and lint
+        run: |
+          find . -type f -name '*.sh' -print0 | xargs -0 -n1 bash -n
+          shellcheck install.sh bin/zfsiscsimp-preflight packaging/build-deb.sh tools/*.sh tests/*.sh debian/*.preinst debian/*.postinst debian/*.prerm debian/*.postrm
+      - name: Perl syntax with minimal PVE compile stubs
+        run: perl -I tests/stubs -c src/PVE/Storage/Custom/ZFSiSCSIMPPlugin.pm
+      - name: Certified upstream contract
+        run: bash tools/check-upstream-contract.sh --certified
+      - name: Build Debian package
+        run: bash packaging/build-deb.sh
+
+  upstream-head-sentinel:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y libjson-perl
+      - name: Require review when depended-on upstream files move
+        run: bash tools/check-upstream-contract.sh --head

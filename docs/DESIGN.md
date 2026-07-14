@@ -23,6 +23,8 @@ Sólo sustituye el acceso del guest y agrega coordinación de lifecycle local.
    la activación compara el WWID y retira primero cualquier identidad stale en ese H:C:I:L.
 8. Operaciones remotas mutantes no se reintentan después de comenzar; primero se elige
    un SSH sano y se ejecutan una sola vez. Lecturas sí pueden probar otro portal.
+9. Una lectura válida sin backstore significa "ausente"; target inaccesible o JSON
+   inválido significa "desconocido" y aborta toda operación destructiva.
 
 ## Identidad LIO
 
@@ -31,14 +33,17 @@ el índice de LUN del JSON persistente. El WWID expuesto por LIO/scsi_id es
 `36001405` seguido por los primeros 25 hex del serial. Se contrastó contra
 `/lib/udev/scsi_id` en runtime.
 
-La cache guarda WWID+LUN por 15 s, conserva una entrada stale sólo si el target está
-temporalmente inaccesible y la invalida en free, rollback y create-base.
+La cache guarda WWID+LUN por 15 s. Una entrada stale puede sostener lecturas no destructivas
+durante una caída del control-plane, pero teardown/free requieren identidad válida o ausencia
+confirmada. La cache se invalida en free, rollback y create-base.
 
 ## Seguridad
 
 La contraseña CHAP es una propiedad sensible de PVE y vive en pmxcfs privado, modo 0600.
-El plugin configura tanto `discoverydb` como los node records. En el target se usa un ACL
-por initiator, `generate_node_acls=0`, `authentication=1` y discovery CHAP.
+El archivo conserva la generación committed y la propuesta; una propiedad interna de
+`storage.cfg` selecciona una sola. Así un fallo del commit no desincroniza configuración y
+secreto. El plugin configura tanto `discoverydb` como los node records. En el target se usa
+un ACL por initiator, `generate_node_acls=0`, `authentication=1` y discovery CHAP.
 
 ## Timeouts del perfil probado
 
@@ -53,6 +58,8 @@ de ambos caminos se encola; no es alta disponibilidad del target.
 
 ## Compatibilidad y límites
 
-Validado con PVE 9.2, storage API 15, multipath-tools 0.11.1, open-iscsi 2.1.11 y LIO
-targetcli 2.1.53. El API se comprueba al instalar. Aún faltan pruebas de migración entre
-dos nodos y hardware/switches físicos.
+La línea 0.3.3 fue validada con PVE 9.2, storage API 15, multipath-tools 0.11.1,
+open-iscsi 2.1.11 y LIO targetcli 2.1.53, incluida migración, recovery HA, package rollback
+y reboot rolling en dos nodos.
+La compatibilidad de upgrades se gobierna con paquete versionado, preflight y rollout
+canario; siguen faltando pruebas sobre hardware/switches físicos y clusters mayores.

@@ -1,0 +1,7 @@
+commit=d666ebd61a5cfcfbc6bec733754f87d56eddf985
+apiver=15
+apiage=6
+82e94379862a27f36f9d0bf1c6d1ce6b7abd1427e71c3269ce41be1701fc46ca  src/PVE/Storage.pm
+6ccfa4b5a0c43ed3fac22a1ccade965288e619d85200d1780b3f047126342aa1  src/PVE/Storage/Plugin.pm
+cfee1060e761f46b7eaf92d98b5369583edfe79d44c355b1348a47c07c52bc8f  src/PVE/Storage/ZFSPlugin.pm
+0901f60e87e45152d775499d6be6027b0f617eae7d846ded2f5e68ce2fb18496  src/PVE/Storage/LunCmd/LIO.pm

@@ -1,0 +1,357 @@
+#!/bin/bash
+# Read-only compatibility and health gate for the zfsiscsimp PVE plugin.
+
+set -uo pipefail
+
+PLUGIN=${PLUGIN:-/usr/share/perl5/PVE/Storage/Custom/ZFSiSCSIMPPlugin.pm}
+SELF=${SELF:-/usr/sbin/zfsiscsimp-preflight}
+CLUSTER=0
+LOCAL_ONLY=0
+CLEANUP_SECRETS=0
+ALLOW_PVE_SKEW=0
+FAILURES=0
+WARNINGS=0
+STORAGES=()
+
+usage() {
+    cat <<'USAGE'
+Usage: zfsiscsimp-preflight [options]
+
+  --storage ID          Check only this storage (repeatable).
+  --cluster             Run the same gate on every online PVE node and compare versions.
+  --allow-pve-skew      With --cluster, allow libpve-storage-perl skew during a rolling upgrade.
+  --cleanup-secrets     Remove mode-0600 CHAP files whose storage ID no longer exists.
+  --local-only          Never fan out to the cluster (used by the cluster gate itself).
+  -h, --help            Show this help.
+
+The default mode is non-destructive. --cleanup-secrets is the only mutating option.
+USAGE
+}
+
+ok() { printf 'OK   %s\n' "$*"; }
+warn() { printf 'WARN %s\n' "$*" >&2; WARNINGS=$((WARNINGS + 1)); }
+fail() { printf 'FAIL %s\n' "$*" >&2; FAILURES=$((FAILURES + 1)); }
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --storage)
+            [ "$#" -ge 2 ] || { echo "--storage requires an ID" >&2; exit 2; }
+            [[ "$2" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || {
+                echo "invalid storage ID '$2'" >&2
+                exit 2
+            }
+            STORAGES+=("$2")
+            shift 2
+            ;;
+        --cluster) CLUSTER=1; shift ;;
+        --allow-pve-skew) ALLOW_PVE_SKEW=1; shift ;;
+        --cleanup-secrets) CLEANUP_SECRETS=1; shift ;;
+        --local-only) LOCAL_ONLY=1; shift ;;
+        -h|--help) usage; exit 0 ;;
+        *) echo "unknown argument: $1" >&2; usage >&2; exit 2 ;;
+    esac
+done
+
+if [ "$LOCAL_ONLY" -eq 1 ] && [ "$CLUSTER" -eq 1 ]; then
+    echo "--local-only and --cluster are mutually exclusive" >&2
+    exit 2
+fi
+if [ "$ALLOW_PVE_SKEW" -eq 1 ] && [ "$CLUSTER" -ne 1 ]; then
+    echo "--allow-pve-skew requires --cluster" >&2
+    exit 2
+fi
+if [ "$CLEANUP_SECRETS" -eq 1 ] && [ "$(id -u)" -ne 0 ]; then
+    echo "--cleanup-secrets must run as root" >&2
+    exit 2
+fi
+
+required_commands=(perl pvesm multipath multipathd iscsiadm sha256sum dpkg-query systemctl getent ip apt-cache)
+for command_name in "${required_commands[@]}"; do
+    if command -v "$command_name" >/dev/null 2>&1; then
+        ok "command $command_name"
+    else
+        fail "required command missing: $command_name"
+    fi
+done
+
+PLUGIN_VERSION=unknown
+PLUGIN_API=unknown
+PVE_API=unknown
+PVE_APIAGE=unknown
+PLUGIN_SHA=missing
+PLUGIN_PACKAGE=manual
+PLUGIN_PACKAGE_STATUS=manual
+PVE_STORAGE_PACKAGE=missing
+PVE_STORAGE_PACKAGE_STATUS=missing
+
+if [ -r "$PLUGIN" ]; then
+    PLUGIN_SHA=$(sha256sum "$PLUGIN" | awk '{print $1}')
+    plugin_info=$(PLUGIN="$PLUGIN" perl -MPVE::Storage -MDigest::SHA=sha256_hex -e '
+        my $plugin = PVE::Storage::Plugin->lookup("zfsiscsimp")
+            or die "plugin did not register\n";
+        my @required_zfs = qw(zfs_request on_add_hook activate_storage free_image
+            create_base volume_snapshot_rollback volume_resize);
+        for my $method (@required_zfs) {
+            die "upstream ZFSPlugin method missing: $method\n"
+                if !PVE::Storage::ZFSPlugin->can($method);
+        }
+        die "base qemu_blockdev_options method missing\n"
+            if !PVE::Storage::Plugin->can("qemu_blockdev_options");
+        my $api = $plugin->api();
+        my ($pve, $age) = (PVE::Storage::APIVER, PVE::Storage::APIAGE);
+        die "API incompatible: plugin=$api PVE supports [" . ($pve-$age) . "..$pve]\n"
+            if $api > $pve || $api < $pve - $age;
+        my $version = $plugin->can("plugin_version") ? $plugin->plugin_version() : "unknown";
+        print join("|", $version, $api, $pve, $age), "\n";
+    ' 2>&1)
+    plugin_rc=$?
+    if [ "$plugin_rc" -eq 0 ]; then
+        IFS='|' read -r PLUGIN_VERSION PLUGIN_API PVE_API PVE_APIAGE <<<"$plugin_info"
+        ok "plugin registered version=$PLUGIN_VERSION api=$PLUGIN_API PVE=$PVE_API age=$PVE_APIAGE"
+    else
+        fail "plugin loader/compatibility check: $plugin_info"
+    fi
+else
+    fail "plugin is not readable at $PLUGIN"
+fi
+
+PVE_STORAGE_PACKAGE=$(dpkg-query -W -f='${Version}' libpve-storage-perl 2>/dev/null || true)
+if [ -n "$PVE_STORAGE_PACKAGE" ]; then
+    PVE_STORAGE_PACKAGE_STATUS=$(dpkg-query -W -f='${db:Status-Abbrev}' \
+        libpve-storage-perl 2>/dev/null || true)
+    if [[ "$PVE_STORAGE_PACKAGE_STATUS" == ii* ]]; then
+        ok "package libpve-storage-perl state ii"
+    else
+        fail "package libpve-storage-perl state is '$PVE_STORAGE_PACKAGE_STATUS', expected ii"
+    fi
+else
+    PVE_STORAGE_PACKAGE=missing
+fi
+PLUGIN_PACKAGE=$(dpkg-query -W -f='${Version}' pve-storage-zfsiscsimp 2>/dev/null || true)
+if [ -n "$PLUGIN_PACKAGE" ]; then
+    PLUGIN_PACKAGE_STATUS=$(dpkg-query -W -f='${db:Status-Abbrev}' \
+        pve-storage-zfsiscsimp 2>/dev/null || true)
+    if [[ "$PLUGIN_PACKAGE_STATUS" == ii* ]]; then
+        ok "package pve-storage-zfsiscsimp state ii"
+    else
+        fail "package pve-storage-zfsiscsimp state is '$PLUGIN_PACKAGE_STATUS', expected ii; reinstall the approved .deb"
+    fi
+else
+    PLUGIN_PACKAGE=manual
+fi
+
+node_name=$(hostname)
+mapfile -t node_ips < <(getent ahostsv4 "$node_name" | awk '{print $1}' | sort -u)
+mapfile -t local_ips < <(ip -4 -o address show scope global | awk '{split($4, a, "/"); print a[1]}')
+node_ip_ok=0
+for node_ip in "${node_ips[@]}"; do
+    [[ "$node_ip" == 127.* ]] && continue
+    for local_ip in "${local_ips[@]}"; do
+        [ "$node_ip" = "$local_ip" ] && node_ip_ok=1
+    done
+done
+if [ "$node_ip_ok" -eq 1 ]; then
+    ok "hostname $node_name resolves to a local non-loopback address"
+else
+    fail "hostname $node_name does not resolve to a local non-loopback address"
+fi
+
+if grep -q 'manage_etc_hosts.*True' /etc/hosts 2>/dev/null; then
+    if grep -RqsE '^[[:space:]]*manage_etc_hosts:[[:space:]]*false' \
+        /etc/cloud/cloud.cfg /etc/cloud/cloud.cfg.d 2>/dev/null; then
+        ok "cloud-init hosts regeneration explicitly disabled"
+    else
+        fail "cloud-init may overwrite /etc/hosts on reboot; set manage_etc_hosts: false"
+    fi
+fi
+
+if command -v pvecm >/dev/null 2>&1 && pvecm status >/dev/null 2>&1; then
+    if [ -r /etc/ssh/ssh_known_hosts ]; then
+        ok "cluster-wide SSH known_hosts is readable"
+    else
+        fail "/etc/ssh/ssh_known_hosts is missing; cluster fan-out/migration SSH is unsafe"
+    fi
+fi
+
+repo_policy=$(apt-cache policy 2>/dev/null || true)
+has_enterprise=0
+has_no_subscription=0
+grep -q 'enterprise\.proxmox\.com/debian/pve' <<<"$repo_policy" && has_enterprise=1
+grep -q 'download\.proxmox\.com/debian/pve' <<<"$repo_policy" && has_no_subscription=1
+if [ "$has_enterprise" -eq 1 ] && [ "$has_no_subscription" -eq 1 ]; then
+    fail "both pve-enterprise and pve-no-subscription repositories are active"
+elif [ "$has_enterprise" -eq 0 ] && [ "$has_no_subscription" -eq 0 ]; then
+    warn "no active Proxmox VE package repository detected in apt-cache policy"
+else
+    ok "exactly one Proxmox VE package repository family is active"
+fi
+
+for service in iscsid multipathd; do
+    if systemctl is-active --quiet "$service"; then
+        ok "service $service active"
+    else
+        fail "service $service is not active"
+    fi
+done
+
+if multipath -t >/dev/null 2>&1; then
+    ok "multipath configuration parses"
+else
+    fail "multipath -t rejected the active configuration"
+fi
+
+if [ "${#STORAGES[@]}" -eq 0 ] && command -v perl >/dev/null 2>&1; then
+    if storage_output=$(perl -MPVE::Storage -e '
+        my $cfg = PVE::Storage::config();
+        for my $id (sort keys %{$cfg->{ids}}) {
+            print "$id\n" if ($cfg->{ids}->{$id}->{type} // "") eq "zfsiscsimp";
+        }
+    ' 2>&1); then
+        mapfile -t STORAGES <<<"$storage_output"
+        [ -n "${STORAGES[0]:-}" ] || STORAGES=()
+    else
+        fail "unable to enumerate storage.cfg: $storage_output"
+    fi
+fi
+
+for storage in "${STORAGES[@]}"; do
+    if pvesm status --storage "$storage" >/dev/null 2>&1; then
+        ok "storage $storage active"
+    else
+        fail "storage $storage is not active"
+        continue
+    fi
+    if pvesm list "$storage" >/dev/null 2>&1; then
+        ok "storage $storage list operation"
+    else
+        fail "storage $storage list operation failed"
+    fi
+
+    if secret_info=$(STORAGE="$storage" perl -MPVE::Storage -MJSON=decode_json -e '
+        my $id = $ENV{STORAGE};
+        my $cfg = PVE::Storage::config();
+        my $scfg = $cfg->{ids}->{$id} or die "storage does not exist\n";
+        die "storage has type $scfg->{type}, expected zfsiscsimp\n"
+            if ($scfg->{type} // "") ne "zfsiscsimp";
+        exit 0 if !defined($scfg->{chapuser});
+        my $path = "/etc/pve/priv/storage/${id}.zfsiscsimp-chap";
+        open(my $fh, "<", $path) or die "CHAP file missing: $!\n";
+        my $mode = (stat($fh))[2] & 07777;
+        die sprintf("CHAP file mode is %04o, expected 0600\n", $mode) if $mode != 0600;
+        my $raw = <$fh>;
+        close($fh);
+        chomp($raw //= "");
+        my $generation = $scfg->{"chap-secret-generation"};
+        if (defined($generation)) {
+            my $prefix = "zfsiscsimp-secret-v1:";
+            die "generation configured but secret file is legacy\n"
+                if index($raw, $prefix) != 0;
+            my $record = decode_json(substr($raw, length($prefix)));
+            die "configured CHAP generation is absent from secret record\n"
+                if ref($record->{secrets}) ne "HASH"
+                || !defined($record->{secrets}->{$generation});
+            print "generation=$generation";
+        } else {
+            die "legacy CHAP password is empty\n" if $raw eq "";
+            print "legacy";
+        }
+    ' 2>&1); then
+        ok "storage $storage CHAP binding ${secret_info:-not-configured}"
+    else
+        fail "storage $storage CHAP binding: $secret_info"
+    fi
+done
+
+if [ "$CLEANUP_SECRETS" -eq 1 ]; then
+    shopt -s nullglob
+    for secret in /etc/pve/priv/storage/*.zfsiscsimp-chap; do
+        filename=${secret##*/}
+        storage=${filename%.zfsiscsimp-chap}
+        if STORAGE="$storage" perl -MPVE::Storage -e '
+            my $cfg = PVE::Storage::config();
+            exit exists($cfg->{ids}->{$ENV{STORAGE}}) ? 0 : 1;
+        ' 2>/dev/null; then
+            ok "kept CHAP file for configured storage $storage"
+        else
+            rm -f -- "$secret"
+            if [ ! -e "$secret" ]; then
+                ok "removed orphan CHAP file for deleted storage $storage"
+            else
+                fail "unable to remove orphan CHAP file $secret"
+            fi
+        fi
+    done
+    shopt -u nullglob
+fi
+
+printf 'IDENTITY node=%s plugin=%s api=%s sha256=%s package=%s libpve-storage-perl=%s\n' \
+    "$(hostname)" "$PLUGIN_VERSION" "$PLUGIN_API" "$PLUGIN_SHA" "$PLUGIN_PACKAGE" \
+    "$PVE_STORAGE_PACKAGE"
+
+if [ "$CLUSTER" -eq 1 ]; then
+    if ! command -v pvesh >/dev/null 2>&1 || ! command -v ssh >/dev/null 2>&1; then
+        fail "cluster mode requires pvesh and ssh"
+    else
+        if nodes_output=$(pvesh get /cluster/status --output-format json 2>/dev/null |
+            perl -MJSON=decode_json -0777 -e '
+                my $rows = decode_json(<>);
+                print "$$_{name}\n" for grep {
+                    ($$_{type} // "") eq "node" && $$_{online}
+                } @$rows;
+            ' 2>&1); then
+            if [ -z "$nodes_output" ]; then
+                fail "cluster has no online nodes"
+            fi
+        else
+            fail "unable to enumerate online cluster nodes: $nodes_output"
+        fi
+        if [ -n "$nodes_output" ]; then
+            reference_plugin=''
+            reference_pve=''
+            while IFS= read -r node; do
+                [ -n "$node" ] || continue
+                remote_args=("$SELF" --local-only)
+                for storage in "${STORAGES[@]}"; do
+                    remote_args+=(--storage "$storage")
+                done
+                remote_output=$(ssh -n -o BatchMode=yes -o ConnectTimeout=10 "root@$node" -- \
+                    "${remote_args[@]}" 2>&1)
+                remote_rc=$?
+                printf '%s\n' "$remote_output" | sed "s/^/[$node] /"
+                if [ "$remote_rc" -ne 0 ]; then
+                    fail "preflight failed on node $node"
+                    continue
+                fi
+                identity=$(printf '%s\n' "$remote_output" | awk '/^IDENTITY / { line=$0 } END { print line }')
+                if [ -z "$identity" ]; then
+                    fail "node $node did not return an IDENTITY line"
+                    continue
+                fi
+                plugin_id=$(printf '%s\n' "$identity" |
+                    sed -n 's/.* plugin=\([^ ]*\).* api=\([^ ]*\).* sha256=\([^ ]*\).* package=\([^ ]*\).*/\1|\2|\3|\4/p')
+                pve_id=$(printf '%s\n' "$identity" |
+                    sed -n 's/.* libpve-storage-perl=\([^ ]*\).*/\1/p')
+                if [ -z "$reference_plugin" ]; then
+                    reference_plugin=$plugin_id
+                    reference_pve=$pve_id
+                else
+                    [ "$plugin_id" = "$reference_plugin" ] ||
+                        fail "plugin version/API/SHA skew detected on node $node"
+                    if [ "$pve_id" != "$reference_pve" ]; then
+                        if [ "$ALLOW_PVE_SKEW" -eq 1 ]; then
+                            warn "libpve-storage-perl skew allowed during rollout on node $node"
+                        else
+                            fail "libpve-storage-perl version skew detected on node $node"
+                        fi
+                    fi
+                fi
+            done <<<"$nodes_output"
+        fi
+    fi
+fi
+
+if [ "$FAILURES" -ne 0 ]; then
+    printf 'PREFLIGHT_FAILED failures=%d warnings=%d\n' "$FAILURES" "$WARNINGS" >&2
+    exit 1
+fi
+printf 'PREFLIGHT_OK warnings=%d\n' "$WARNINGS"

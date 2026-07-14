@@ -1,5 +1,61 @@
 # Changelog
 
+## 0.3.3 — 2026-07-14
+
+Artefacto final del hardening de upgrades.
+
+- El gate de estado acepta el padding documentado de `${db:Status-Abbrev}` sin aceptar
+  estados distintos de `ii`.
+- Transición real `ii→ri→ii` certificada: remoción bloqueada, detección fail-closed y
+  recuperación mediante reinstalación del `.deb` aprobado.
+- Se cambió versión de paquete y plugin para no publicar los hashes 0.3.2 del laboratorio.
+
+## 0.3.2 — 2026-07-14
+
+Validación final del hardening de upgrades.
+
+- Preflight exige estado `ii` de su paquete y de `libpve-storage-perl`; detecta también el
+  estado `ri` que `dpkg` conserva después de una remoción rechazada y pide reinstalar.
+- Nuevo benchmark destructivo y autocontenido de `1×100` contra `2×100 Mbit/s`, con shaping
+  bidireccional, volumen scratch, restauración por trap y umbral mínimo de escalamiento.
+- Se cambió versión de paquete y plugin para no reutilizar los hashes 0.3.1 del laboratorio.
+
+## 0.3.1 — 2026-07-14
+
+Hardening del host y certificación del mecanismo de upgrade.
+
+- Preflight detecta hostname local resolviendo a loopback/no-local, cloud-init capaz de
+  pisar `/etc/hosts`, `ssh_known_hosts` cluster-wide ausente y repos enterprise/no-subscription
+  activos simultáneamente.
+- El gate cluster compara también la versión del paquete, además de API/versión/SHA del plugin.
+- El paquete rechaza su remoción mientras `storage.cfg` todavía contenga un storage
+  `zfsiscsimp`, evitando que el siguiente reload deje el tipo desconocido.
+- El paquete declara `libjson-perl`, usado directamente por el formato transaccional de
+  secretos, en vez de depender de que llegue transitivamente.
+- Rollback de paquete certificado inyectando `api=999`: `postinst` falló, restauró el SHA
+  anterior, mantuvo el storage activo y una reinstalación válida dejó `dpkg` consistente.
+- Rollout 0.3.0 validado en ambos nodos, conversión CHAP legacy→generacional, migración HA,
+  updates rolling, reboot de ambos nodos y recuperación con dos paths.
+- Fix operativo del lab: repositorio enterprise sin suscripción deshabilitado en el segundo
+  nodo; `/etc/hosts` persistente y host keys/symlink global reparados.
+
+## 0.3.0 — 2026-07-14
+
+Hardening de upgrades y operaciones destructivas.
+
+- Identidad fail-closed: saveconfig inaccesible/malformado ya no se confunde con backstore
+  ausente; `free`/rollback/template abortan ante estado desconocido.
+- CHAP transaccional: `storage.cfg` selecciona una generación de secreto. Si pmxcfs falla
+  después del hook, la config anterior sigue usando la credencial anterior. Los secretos se
+  eliminan sólo mediante GC post-commit verificable.
+- Nuevo `zfsiscsimp-preflight`: loader/API, contrato upstream, SHA/version skew, paquetes,
+  servicios, multipath, storage y binding CHAP; modo cluster y tolerancia de skew canario.
+- `install.sh` con `flock`, rollback en error/señal, dos archivos atómicos, rollback de
+  multipath y backups acotados; ya no ejecuta `apt` implícitamente.
+- Paquete Debian `pve-storage-zfsiscsimp` con rollback de archivos si falla `postinst`.
+- Tests nuevos: control-plane total fail-closed, transacción CHAP y gate de upgrade.
+- Runbook rolling/canario, inventario de estado cluster/local y recuperación documentados.
+
 ## 0.2.2 — 2026-07-14
 
 HA real certificada (recuperación automática ante muerte de nodo) + fix de deployment.

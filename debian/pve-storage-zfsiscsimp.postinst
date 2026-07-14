@@ -1,0 +1,67 @@
+#!/bin/bash
+# shellcheck disable=SC2317
+set -e
+
+STATE_DIR=/var/lib/pve-storage-zfsiscsimp/preinst
+COMMITTED=0
+
+reload_daemons() {
+    for service in pvedaemon pveproxy pvestatd pvescheduler pve-ha-lrm pve-ha-crm; do
+        systemctl cat "${service}.service" >/dev/null 2>&1 || continue
+        systemctl reload-or-restart "$service" || true
+    done
+}
+
+rollback_package_files() {
+    if [ -e "$STATE_DIR/plugin.had-original" ]; then
+        cp -a "$STATE_DIR/plugin.backup" \
+            /usr/share/perl5/PVE/Storage/Custom/ZFSiSCSIMPPlugin.pm
+    else
+        rm -f -- /usr/share/perl5/PVE/Storage/Custom/ZFSiSCSIMPPlugin.pm
+    fi
+    if [ -e "$STATE_DIR/preflight.had-original" ]; then
+        cp -a "$STATE_DIR/preflight.backup" /usr/sbin/zfsiscsimp-preflight
+    else
+        rm -f -- /usr/sbin/zfsiscsimp-preflight
+    fi
+    reload_daemons
+}
+
+on_exit() {
+    rc=$?
+    trap - EXIT
+    if [ "$rc" -ne 0 ] && [ "$COMMITTED" -eq 0 ] && [ -d "$STATE_DIR" ]; then
+        echo "zfsiscsimp postinst failed; restoring pre-upgrade files" >&2
+        rollback_package_files
+    fi
+    exit "$rc"
+}
+trap on_exit EXIT
+
+case "${1:-}" in
+    configure)
+        systemctl enable --now iscsid multipathd
+        perl -MPVE::Storage -e '
+            my $plugin = PVE::Storage::Plugin->lookup("zfsiscsimp")
+                or die "zfsiscsimp did not register\n";
+            my ($api, $pve, $age) =
+                ($plugin->api(), PVE::Storage::APIVER, PVE::Storage::APIAGE);
+            die "zfsiscsimp API $api is outside [" . ($pve-$age) . "..$pve]\n"
+                if $api > $pve || $api < $pve-$age;
+        '
+        services=(pvedaemon pveproxy pvestatd pvescheduler)
+        for ha in pve-ha-lrm pve-ha-crm; do
+            systemctl cat "${ha}.service" >/dev/null 2>&1 && services+=("$ha")
+        done
+        for service in "${services[@]}"; do
+            systemctl reload-or-restart "$service"
+            systemctl is-active --quiet "$service"
+        done
+        rm -rf -- "$STATE_DIR"
+        COMMITTED=1
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

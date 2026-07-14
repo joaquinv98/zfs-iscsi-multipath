@@ -1,0 +1,14 @@
+Source: pve-storage-zfsiscsimp
+Section: admin
+Priority: optional
+Maintainer: Joaquin Varela <joaquinv898@gmail.com>
+Build-Depends: debhelper-compat (= 13)
+Standards-Version: 4.7.0
+Rules-Requires-Root: no
+
+Package: pve-storage-zfsiscsimp
+Architecture: all
+Depends: ${misc:Depends}, ${perl:Depends}, libjson-perl, libpve-storage-perl, open-iscsi, multipath-tools
+Description: ZFS over iSCSI multipath storage plugin for Proxmox VE
+ Custom Proxmox VE storage plugin that retains the ZFS/LIO control plane and
+ uses open-iscsi plus dm-multipath for a redundant kernel data plane.
