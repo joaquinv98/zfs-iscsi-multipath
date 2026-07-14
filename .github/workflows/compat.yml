@@ -10,9 +10,9 @@ jobs:
   static-and-package:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install validation dependencies
-        run: sudo apt-get update && sudo apt-get install -y debhelper devscripts libjson-perl shellcheck
+        run: sudo apt-get update && sudo apt-get install -y build-essential debhelper devscripts libjson-perl shellcheck
       - name: Shell syntax and lint
         run: |
           find . -type f -name '*.sh' -print0 | xargs -0 -n1 bash -n
@@ -28,7 +28,7 @@ jobs:
     if: github.event_name == 'schedule'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install dependencies
         run: sudo apt-get update && sudo apt-get install -y libjson-perl
       - name: Require review when depended-on upstream files move
